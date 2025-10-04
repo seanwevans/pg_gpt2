@@ -1,0 +1,4 @@
+comment = 'GPT-2 numerical kernels for Postgres'
+default_version = '0.1.0'
+relocatable = false
+module_pathname = '$libdir/pg_llm'

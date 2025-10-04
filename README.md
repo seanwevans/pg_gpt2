@@ -1,0 +1,196 @@
+# pg_llm
+
+**pg_llm** is a complete implementation of the GPT-2 architecture *entirely inside PostgreSQL*.
+It extends the database with tensor algebra, automatic differentiation, AdamW optimization, checkpointing, and a Byte-Pair Encoding tokenizer — allowing end-to-end training and text generation purely through SQL and C extensions.
+
+---
+
+## Overview
+
+PostgreSQL is used as both the **storage** and **execution environment** for a large-scale transformer model.
+Each layer, weight, and intermediate activation lives in relational tables; tensor operations are implemented as `C` functions returning `BYTEA` buffers.
+Every forward pass, gradient computation, and parameter update is a deterministic SQL transaction.
+
+The project demonstrates that a relational database can serve as a full numerical engine, state store, and model runtime — no Python, PyTorch, or external ML stack required.
+
+---
+
+## Core Design Principles
+
+1. **Postgres as OS** — All computation and persistence live in SQL schemas and C extensions.
+2. **Full Reproducibility** — Every step, gradient, and checkpoint is a logged transaction.
+3. **Numerical Fidelity** — Bit-level parity with PyTorch’s GPT-2 (`float32`, row-major, GELU, LayerNorm, AdamW).
+4. **Composability** — Every tensor op is an SQL function; model architectures are relational graphs.
+5. **Auditable Learning** — Because gradients and weights are rows, the entire training process is queryable and replayable.
+
+---
+
+## Architecture Summary
+
+| Component | Description |
+|------------|-------------|
+| **Tensor Engine** | C implementations of `matmul`, `add`, `gelu`, `softmax`, `layernorm`, `cross_entropy` over contiguous `float32` blobs (`BYTEA`). |
+| **Autodiff Engine** | Reverse-mode differentiation recorded in a relational *tape* (`llm_tape`, `llm_tensor_rt`), supporting backpropagation of all GPT-2 ops. |
+| **Optimizer** | AdamW with bias correction, decoupled weight decay, gradient clipping, and cosine learning-rate schedule. |
+| **Checkpointing** | Import/export weights as `.npz` or `.safetensors` archives. Every snapshot is versioned in `llm_checkpoint`. |
+| **Tokenizer** | Native Byte-Pair Encoding (BPE) tokenizer/decoder built from `vocab.json` + `merges.txt`. |
+| **Sampling Engine** | Temperature, top-k, and top-p (nucleus) sampling for autoregressive generation. |
+| **Training Loop** | SQL functions (`llm_train`, `llm_train_step`, `llm_loss`) orchestrate forward, backward, optimizer updates, and logging. |
+| **Inference** | `llm_generate(prompt)` runs encoding → forward → sampling → decoding, returning coherent text completions. |
+
+---
+
+## Key Tables
+
+| Table | Purpose |
+|--------|----------|
+| `llm_param` | Model parameters, gradients, optimizer state. |
+| `llm_dataset` | Tokenized training sequences. |
+| `llm_tape` / `llm_tensor_rt` | Computational graph and runtime tensors for autograd. |
+| `llm_checkpoint` | Versioned checkpoint metadata and file paths. |
+| `llm_bpe_vocab` / `llm_bpe_merges` | GPT-2 tokenizer vocabulary and merge ranks. |
+| `llm_train_log` | Per-step learning rate and loss history. |
+
+---
+
+## SQL API Reference
+
+### Model Initialization
+
+```sql
+SELECT pg_llm_import_npz('/mnt/models/gpt2-small.npz', 'gpt2-small');
+```
+
+Imports all pretrained GPT-2 weights into the `llm_param` table.
+
+### Forward Pass and Inference
+
+```sql
+-- Generate text directly in SQL
+SELECT llm_generate('Once upon a time', 80, 0.9, 40, 0.92);
+```
+
+### Training
+
+```sql
+-- Train for 10,000 steps on tokenized text dataset
+SELECT llm_train(
+  'gpt2-small',
+  10000,        -- steps
+  12, 12, 768,  -- layers, heads, hidden size
+  50257,        -- vocab size
+  0.9, 0.999, 1e-8, 0.01, 2.5e-4, 2000
+);
+```
+
+Every step performs:
+1. Forward pass → loss (`llm_loss`)
+2. Reverse pass (`llm_backprop`)
+3. Gradient accumulation
+4. AdamW parameter updates
+5. Logging to `llm_train_log`
+
+### Checkpointing
+
+```sql
+-- Save a new checkpoint
+SELECT llm_checkpoint_save('gpt2-small','after warmup 2k');
+
+-- Restore a checkpoint
+SELECT llm_checkpoint_load('gpt2-small',1);
+```
+
+### Tokenizer Utilities
+
+```sql
+-- Load GPT-2 BPE vocab and merges
+SELECT pg_llm_load_bpe_vocab('/mnt/gpt2/vocab.json','gpt2-small');
+SELECT pg_llm_load_bpe_merges('/mnt/gpt2/merges.txt','gpt2-small');
+
+-- Encode and decode text
+SELECT llm_encode('Hello world!','gpt2-small');
+SELECT llm_decode(ARRAY[15496,2159,0],'gpt2-small');
+```
+
+---
+
+## Mathematical Fidelity
+
+All core operations follow the official GPT-2 equations:
+
+**Attention**
+\[
+\mathrm{Attn}(x) = \mathrm{softmax}\!\left(\frac{QK^T}{\sqrt{d_k}} + M\right)V
+\]
+with causal masking and learned positional embeddings.
+
+**Feed-Forward**
+\[
+\mathrm{FFN}(x) = \mathrm{GELU}(xW_1 + b_1)W_2 + b_2
+\]
+
+**LayerNorm**
+\[
+y = \frac{x - \mu}{\sqrt{\sigma^2 + \epsilon}}\gamma + \beta
+\]
+
+**Loss**
+\[
+L = -\log \frac{e^{z_t}}{\sum_j e^{z_j}}
+\]
+
+**Optimizer (AdamW)**
+\[
+\begin{aligned}
+m_t &= \beta_1 m_{t-1} + (1-\beta_1) g_t \\
+v_t &= \beta_2 v_{t-1} + (1-\beta_2) g_t^2 \\
+\hat{m}_t &= m_t / (1-\beta_1^t), \quad
+\hat{v}_t = v_t / (1-\beta_2^t) \\
+\theta_t &= \theta_{t-1} - \eta (\hat{m}_t / (\sqrt{\hat{v}_t}+\epsilon) + \lambda\theta_{t-1})
+\end{aligned}
+\]
+
+---
+
+## Example: End-to-End Flow
+
+```sql
+-- 1. Load model + tokenizer
+SELECT pg_llm_import_npz('/mnt/models/gpt2-small.npz','gpt2-small');
+SELECT pg_llm_load_bpe_vocab('/mnt/gpt2/vocab.json','gpt2-small');
+SELECT pg_llm_load_bpe_merges('/mnt/gpt2/merges.txt','gpt2-small');
+
+-- 2. Encode text
+SELECT llm_encode('The database that dreamed of language.','gpt2-small');
+
+-- 3. Generate continuation
+SELECT llm_generate('The database that dreamed of language', 40, 0.8, 40, 0.95);
+
+-- 4. Train or fine-tune
+SELECT llm_train('gpt2-small', 5000, 12, 12, 768, 50257);
+
+-- 5. Save checkpoint
+SELECT llm_checkpoint_save('gpt2-small','finetuned on corpus X');
+```
+
+---
+
+## Performance Notes
+
+- All tensors are stored as raw `BYTEA` blobs and processed in-memory.
+- CPU backend uses simple C loops; BLAS or SIMD integration (e.g. OpenBLAS, libxsimd) is optional.
+- For large models, Postgres memory limits and `work_mem` should be increased.
+- `UNLOGGED` tables are used for intermediate activations to minimize I/O overhead.
+- Autograd tape pruning and gradient accumulation can be parallelized safely within a transaction.
+
+---
+
+## Why Do This?
+
+- **Proof of Concept:** show that gradient-based learning can be expressed purely as relational algebra and transaction semantics.
+- **Determinism:** every computation is replayable and version-controlled.
+- **Integration:** unifies data, model, and training loop under a single ACID engine.
+- **Pedagogy:** transparent view into transformer internals, queryable step-by-step.
+- **Playfulness:** Postgres literally *thinks*.
+
+> *The database dreamt of language — and woke up speaking SQL.*
