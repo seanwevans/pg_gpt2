@@ -9,6 +9,8 @@ sql/pg_llm--0.1.0.sql \
 sql/llm_block_forward.sql \
 sql/llm_backprop.sql
 
+REGRESS = adamw
+
 PG_CPPFLAGS += -I$(srcdir)/src
 
 PG_CONFIG = pg_config
