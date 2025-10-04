@@ -191,6 +191,3 @@ SELECT llm_checkpoint_save('gpt2-small','finetuned on corpus X');
 - **Determinism:** every computation is replayable and version-controlled.
 - **Integration:** unifies data, model, and training loop under a single ACID engine.
 - **Pedagogy:** transparent view into transformer internals, queryable step-by-step.
-- **Playfulness:** Postgres literally *thinks*.
-
-> *The database dreamt of language — and woke up speaking SQL.*
