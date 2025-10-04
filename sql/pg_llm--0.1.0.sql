@@ -65,12 +65,13 @@ LANGUAGE C STRICT;
 CREATE TABLE llm_param (
     model TEXT,
     name TEXT,
+    token_id INT DEFAULT 0,
     data BYTEA,           -- current parameter
     grad BYTEA,           -- accumulated gradient
     m BYTEA,              -- AdamW first moment
     v BYTEA,              -- AdamW second moment
     step INT DEFAULT 0,
-    PRIMARY KEY (model, name)
+    PRIMARY KEY (model, name, token_id)
 );
 
 CREATE TABLE llm_train_log (
@@ -109,7 +110,9 @@ BEGIN
 
     -- 3. Final linear projection (tie weights with token_emb)
     logits := pg_llm_matmul(x,
-        (SELECT data FROM llm_param WHERE model=model AND name='wte'),
+        (SELECT string_agg(p.data::TEXT, '' ORDER BY p.token_id)::BYTEA
+         FROM llm_param p
+         WHERE p.model = model AND p.name = 'wte'),
         array_length(tokens,1), D, vocab);
 
     -- 4. Compute loss per token
@@ -176,12 +179,16 @@ DECLARE
     out BYTEA;
 BEGIN
     -- Flatten token embeddings
-    SELECT string_agg(data::TEXT,'')::BYTEA INTO out
-    FROM (
-        SELECT data FROM llm_param
-        WHERE model=model AND name='wte' AND ord = ANY(tokens)
-        ORDER BY array_position(tokens, ord)
-    ) q;
+    SELECT string_agg(p.data::TEXT, '' ORDER BY t.ord)::BYTEA INTO out
+    FROM unnest(tokens) WITH ORDINALITY AS t(token_id, ord)
+    JOIN llm_param p
+      ON p.model = model
+     AND p.name = 'wte'
+     AND p.token_id = t.token_id;
+
+    IF out IS NULL THEN
+        RAISE EXCEPTION 'Missing embeddings for one or more tokens in model %', model;
+    END IF;
     RETURN out;
 END;
 $$ LANGUAGE plpgsql;
