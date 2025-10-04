@@ -21,8 +21,38 @@ PG_FUNCTION_INFO_V1(pg_llm_cross_entropy);
 static inline float* as_float(bytea *b) {
     return (float*) VARDATA_ANY(b);
 }
+
 static inline size_t nbytes(bytea *b) {
     return VARSIZE_ANY_EXHDR(b);
+}
+
+static inline bytea* bytea_alloc(Size payload_bytes) {
+    bytea *out = (bytea*) palloc(payload_bytes + VARHDRSZ);
+    SET_VARSIZE(out, payload_bytes + VARHDRSZ);
+    return out;
+}
+
+static inline bytea* bytea_same_size(bytea *src) {
+    return bytea_alloc(nbytes(src));
+}
+
+static inline int float_length(bytea *b, const char *fn_name) {
+    Size size = nbytes(b);
+    if (size % sizeof(float) != 0)
+        ereport(ERROR,
+                (errmsg("%s expected a float32-aligned bytea (got %zu bytes)",
+                        fn_name, size)));
+    return (int)(size / sizeof(float));
+}
+
+static inline void ensure_same_size(bytea *a, bytea *b, const char *fn_name) {
+    Size size_a = nbytes(a);
+    Size size_b = nbytes(b);
+    if (size_a != size_b) {
+        ereport(ERROR,
+                (errmsg("%s expects inputs with identical length (got %zu and %zu bytes)",
+                        fn_name, size_a, size_b)));
+    }
 }
 
 #endif
