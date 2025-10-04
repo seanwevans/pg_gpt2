@@ -9,11 +9,22 @@ Datum pg_llm_matmul(PG_FUNCTION_ARGS)
     int k = PG_GETARG_INT32(3);
     int n = PG_GETARG_INT32(4);
 
+    if (m <= 0 || k <= 0 || n <= 0)
+        ereport(ERROR, (errmsg("pg_llm_matmul requires positive matrix dimensions")));
+
+    size_t expected_a = (size_t) m * k * sizeof(float);
+    size_t expected_b = (size_t) k * n * sizeof(float);
+    if (nbytes(a) != expected_a)
+        ereport(ERROR,
+                (errmsg("pg_llm_matmul expected left matrix of %d x %d elements", m, k)));
+    if (nbytes(b) != expected_b)
+        ereport(ERROR,
+                (errmsg("pg_llm_matmul expected right matrix of %d x %d elements", k, n)));
+
     float *A = as_float(a);
     float *B = as_float(b);
-    size_t out_bytes = m * n * sizeof(float);
-    bytea *out = (bytea*) palloc(out_bytes + VARHDRSZ);
-    SET_VARSIZE(out, out_bytes + VARHDRSZ);
+    size_t out_bytes = (size_t) m * n * sizeof(float);
+    bytea *out = bytea_alloc(out_bytes);
     float *C = as_float(out);
 
     for (int i = 0; i < m; i++) {
@@ -32,10 +43,12 @@ Datum pg_llm_add(PG_FUNCTION_ARGS)
 {
     bytea *a = PG_GETARG_BYTEA_P(0);
     bytea *b = PG_GETARG_BYTEA_P(1);
-    int n = (int)(nbytes(a) / sizeof(float));
+    ensure_same_size(a, b, "pg_llm_add");
 
-    bytea *out = (bytea*) palloc(VARSIZE_ANY_EXHDR(a) + VARHDRSZ);
-    SET_VARSIZE(out, VARSIZE_ANY_EXHDR(a) + VARHDRSZ);
+    int n = float_length(a, "pg_llm_add");
+    (void) float_length(b, "pg_llm_add");
+
+    bytea *out = bytea_same_size(a);
 
     float *A = as_float(a);
     float *B = as_float(b);
@@ -52,10 +65,11 @@ Datum pg_llm_add(PG_FUNCTION_ARGS)
 Datum pg_llm_gelu(PG_FUNCTION_ARGS)
 {
     bytea *a = PG_GETARG_BYTEA_P(0);
-    int n = (int)(nbytes(a) / sizeof(float));
+    int n = float_length(a, "pg_llm_gelu");
+    if (n == 0)
+        ereport(ERROR, (errmsg("pg_llm_gelu requires a non-empty input")));
 
-    bytea *out = (bytea*) palloc(VARSIZE_ANY_EXHDR(a) + VARHDRSZ);
-    SET_VARSIZE(out, VARSIZE_ANY_EXHDR(a) + VARHDRSZ);
+    bytea *out = bytea_same_size(a);
 
     float *A = as_float(a);
     float *Y = as_float(out);
@@ -74,11 +88,13 @@ Datum pg_llm_gelu(PG_FUNCTION_ARGS)
 Datum pg_llm_softmax(PG_FUNCTION_ARGS)
 {
     bytea *a = PG_GETARG_BYTEA_P(0);
-    int n = (int)(nbytes(a) / sizeof(float));
+    int n = float_length(a, "pg_llm_softmax");
+    if (n == 0)
+        ereport(ERROR, (errmsg("pg_llm_softmax requires a non-empty input")));
+
     float *A = as_float(a);
 
-    bytea *out = (bytea*) palloc(VARSIZE_ANY_EXHDR(a) + VARHDRSZ);
-    SET_VARSIZE(out, VARSIZE_ANY_EXHDR(a) + VARHDRSZ);
+    bytea *out = bytea_same_size(a);
     float *Y = as_float(out);
 
     float maxv = A[0];
@@ -103,13 +119,20 @@ Datum pg_llm_layernorm(PG_FUNCTION_ARGS)
     bytea *beta_b = PG_GETARG_BYTEA_P(2);
     float eps = PG_GETARG_FLOAT4(3);
 
-    int n = (int)(nbytes(x_b) / sizeof(float));
+    int n = float_length(x_b, "pg_llm_layernorm");
+    if (n == 0)
+        ereport(ERROR, (errmsg("pg_llm_layernorm requires a non-empty input")));
+
     float *x = as_float(x_b);
     float *gamma = as_float(gamma_b);
     float *beta = as_float(beta_b);
 
-    bytea *out = (bytea*) palloc(VARSIZE_ANY_EXHDR(x_b) + VARHDRSZ);
-    SET_VARSIZE(out, VARSIZE_ANY_EXHDR(x_b) + VARHDRSZ);
+    (void) float_length(gamma_b, "pg_llm_layernorm");
+    (void) float_length(beta_b, "pg_llm_layernorm");
+    ensure_same_size(x_b, gamma_b, "pg_llm_layernorm");
+    ensure_same_size(x_b, beta_b, "pg_llm_layernorm");
+
+    bytea *out = bytea_same_size(x_b);
     float *y = as_float(out);
 
     float mean = 0.f;
@@ -136,8 +159,14 @@ Datum pg_llm_cross_entropy(PG_FUNCTION_ARGS)
     bytea *logits_b = PG_GETARG_BYTEA_P(0);
     int target = PG_GETARG_INT32(1);
 
-    int n = (int)(nbytes(logits_b) / sizeof(float));
+    int n = float_length(logits_b, "pg_llm_cross_entropy");
+    if (n == 0)
+        ereport(ERROR, (errmsg("pg_llm_cross_entropy requires a non-empty logits vector")));
+
     float *z = as_float(logits_b);
+
+    if (target < 0 || target >= n)
+        ereport(ERROR, (errmsg("pg_llm_cross_entropy target index %d out of bounds", target)));
 
     float maxv = z[0];
     for (int i = 1; i < n; i++) if (z[i] > maxv) maxv = z[i];
