@@ -1,6 +1,6 @@
-# pg_llm
+# pg_gpt2
 
-**pg_llm** is a complete implementation of the GPT-2 architecture *entirely inside PostgreSQL*.
+**pg_gpt2** is a complete implementation of the GPT-2 architecture *entirely inside PostgreSQL*.
 It extends the database with tensor algebra, automatic differentiation, AdamW optimization, checkpointing, and a Byte-Pair Encoding tokenizer — allowing end-to-end training and text generation purely through SQL and C extensions.
 
 ---

@@ -45,14 +45,15 @@ Datum pg_llm_adamw_step(PG_FUNCTION_ARGS)
     float bc1 = 1.0f - powf(b1, t);
     float bc2 = 1.0f - powf(b2, t);
 
+    /* Follow AdamW (Loshchilov & Hutter, 2019) with decoupled weight decay. */
     for (int i=0;i<n;++i) {
-        float grad = g[i] + wd * w[i];           /* decoupled weight decay */
+        float grad = g[i];
         float m_t  = b1*m[i] + (1.0f-b1)*grad;
         float v_t  = b2*v[i] + (1.0f-b2)*grad*grad;
         float m_hat = m_t / bc1;
         float v_hat = v_t / bc2;
         float step  = lr * m_hat / (sqrtf(v_hat) + eps);
-        wo[i] = w[i] - step;
+        wo[i] = w[i] - step - lr * wd * w[i];
         mo[i] = m_t;
         vo[i] = v_t;
     }
