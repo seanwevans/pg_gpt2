@@ -33,30 +33,36 @@ Datum pg_llm_attention(PG_FUNCTION_ARGS)
     const float scale = 1.0f / sqrtf((float)head_dim);
 
     /* 1. Q,K,V = x @ W_qkv, then split */
-    float *qkv = palloc(T * 3 * D * sizeof(float));
-    for (int t=0; t<T; ++t)
-      for (int j=0; j<3*D; ++j){
-          float s=0;
-          for (int k=0;k<D;++k)
-              s += x[t*D + k]*w_qkv[k*3*D + j];
-          qkv[t*3*D + j]=s;
-      }
+    float *Q = palloc(T * D * sizeof(float));
+    float *K = palloc(T * D * sizeof(float));
+    float *V = palloc(T * D * sizeof(float));
+    for (int t=0; t<T; ++t) {
+        for (int j=0; j<3*D; ++j) {
+            float s = 0.0f;
+            for (int k=0; k<D; ++k)
+                s += x[t*D + k] * w_qkv[k*3*D + j];
+            if (j < D)
+                Q[t*D + j] = s;
+            else if (j < 2*D)
+                K[t*D + (j - D)] = s;
+            else
+                V[t*D + (j - 2*D)] = s;
+        }
+    }
 
     /* 2. iterate heads */
     for (int h=0; h<n_head; ++h) {
         int off = h*head_dim;
-        float *Q = &qkv[0*D + off];
-        float *K = &qkv[1*D + off];
-        float *V = &qkv[2*D + off];
-
         /* compute attention weights: (T×head_dim) × (head_dim×T) */
         for (int i=0; i<T; ++i) {
+            int q_base = i*D + off;
             float scores[1024]; /* max ctx len = 1024 */
             float maxs = -1e9f;
             for (int j=0;j<=i;++j){          /* causal mask */
+                int k_base = j*D + off;
                 float dot=0;
                 for(int d=0;d<head_dim;++d)
-                    dot += Q[i*D + off + d]*K[j*D + off + d];
+                    dot += Q[q_base + d]*K[k_base + d];
                 dot *= scale;
                 scores[j]=dot;
                 if(dot>maxs)maxs=dot;
@@ -69,9 +75,11 @@ Datum pg_llm_attention(PG_FUNCTION_ARGS)
             /* weighted sum over V */
             for(int d=0;d<head_dim;++d){
                 float acc=0;
-                for(int j=0;j<=i;++j)
-                    acc += scores[j]*V[j*D + off + d];
-                Y[i*D + off + d] = acc;
+                for(int j=0;j<=i;++j){
+                    int v_base = j*D + off;
+                    acc += scores[j]*V[v_base + d];
+                }
+                Y[q_base + d] = acc;
             }
         }
     }
@@ -86,6 +94,9 @@ Datum pg_llm_attention(PG_FUNCTION_ARGS)
           tmp[i*D + j]=s;
       }
     memcpy(Y,tmp,T*D*sizeof(float));
-    pfree(tmp); pfree(qkv);
+    pfree(tmp);
+    pfree(Q);
+    pfree(K);
+    pfree(V);
     PG_RETURN_BYTEA_P(out);
 }
