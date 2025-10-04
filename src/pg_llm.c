@@ -1,5 +1,14 @@
 #include "pg_llm.h"
 
+PG_MODULE_MAGIC;
+
+PG_FUNCTION_INFO_V1(pg_llm_matmul);
+PG_FUNCTION_INFO_V1(pg_llm_add);
+PG_FUNCTION_INFO_V1(pg_llm_gelu);
+PG_FUNCTION_INFO_V1(pg_llm_softmax);
+PG_FUNCTION_INFO_V1(pg_llm_layernorm);
+PG_FUNCTION_INFO_V1(pg_llm_cross_entropy);
+
 /* ------------------ MATMUL ------------------ */
 Datum pg_llm_matmul(PG_FUNCTION_ARGS)
 {

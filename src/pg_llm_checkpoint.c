@@ -7,8 +7,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <zlib.h>
-#include <json-c/json.h>
-#include "numpy/ndarrayobject.h"   /* if available */
 
 typedef struct npy_header_t
 {
