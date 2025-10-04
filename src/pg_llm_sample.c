@@ -2,6 +2,19 @@
 #include <stdlib.h>
 #include <time.h>
 
+static int
+compare_desc_float(const void *a, const void *b)
+{
+    float x = *(const float *)a;
+    float y = *(const float *)b;
+
+    if (x < y)
+        return 1;
+    if (x > y)
+        return -1;
+    return 0;
+}
+
 PG_FUNCTION_INFO_V1(pg_llm_sample);
 
 /*
@@ -32,9 +45,7 @@ Datum pg_llm_sample(PG_FUNCTION_ARGS)
     if (topk>0 && topk<n) {
         float *copy = palloc(n*sizeof(float));
         memcpy(copy,p,n*sizeof(float));
-        qsort(copy,n,sizeof(float),[](const void*a,const void*b){
-            float x=*(float*)a, y=*(float*)b; return (y>x)-(y<x);
-        });
+        qsort(copy,n,sizeof(float),compare_desc_float);
         float thresh = copy[topk-1];
         for(int i=0;i<n;++i) if(p[i]<thresh) p[i]=0;
         pfree(copy);
