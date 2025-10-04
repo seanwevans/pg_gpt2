@@ -5,6 +5,7 @@
 #include "fmgr.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
+#include "funcapi.h"
 #include <math.h>
 
 PG_MODULE_MAGIC;
