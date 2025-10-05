@@ -28,6 +28,11 @@ RETURNS FLOAT4
 AS 'MODULE_PATHNAME', 'pg_llm_cross_entropy'
 LANGUAGE C STRICT;
 
+CREATE FUNCTION pg_llm_cross_entropy_backward(logits BYTEA, target INT)
+RETURNS BYTEA
+AS 'MODULE_PATHNAME', 'pg_llm_cross_entropy_backward'
+LANGUAGE C STRICT;
+
 CREATE FUNCTION pg_llm_dropout(input BYTEA, p FLOAT4, training BOOLEAN DEFAULT false)
 RETURNS BYTEA
 AS 'MODULE_PATHNAME', 'pg_llm_dropout'
@@ -113,6 +118,11 @@ CREATE UNLOGGED TABLE llm_tensor (
     requires_grad BOOL DEFAULT false
 );
 
+-- Single-row toggle to enable/disable autograd recording during forward passes
+CREATE UNLOGGED TABLE llm_autograd_mode (
+    flag BOOLEAN PRIMARY KEY
+);
+
 CREATE TABLE llm_train_log (
     model TEXT,
     step INT,
@@ -193,7 +203,8 @@ CREATE OR REPLACE FUNCTION llm_train_step(
     wd FLOAT4,
     lr_max FLOAT4,
     warmup INT,
-    total_steps INT)
+    total_steps INT,
+    grad_clip FLOAT4 DEFAULT NULL)
 RETURNS FLOAT4 AS $$
 DECLARE
     seq INT[];
@@ -216,18 +227,19 @@ BEGIN
     WHERE llm_param.model = model;
 
     lr := pg_llm_lr_schedule(step_count, warmup, total_steps, lr_max);
-
-    loss := llm_loss(model, seq, target, n_layer, n_head, D, vocab,
-                     dropout_p => dropout_p,
-                     training => true);
     -- Reset autograd state from the previous step
     DELETE FROM llm_tape;
     DELETE FROM llm_tensor_rt;
     DELETE FROM llm_autograd_mode;
 
+    -- Populate cached tensors for the forward pass
+    PERFORM llm_materialize_params(model);
+
     -- Forward pass with autograd recording enabled
     INSERT INTO llm_autograd_mode(flag) VALUES(true);
-    loss := llm_loss(model, seq, target, n_layer, n_head, D, vocab);
+    loss := llm_loss(model, seq, target, n_layer, n_head, D, vocab,
+                     dropout_p => dropout_p,
+                     training => true);
     DELETE FROM llm_autograd_mode;
 
     SELECT MAX(id) INTO tape_top FROM llm_tape;
@@ -242,7 +254,12 @@ BEGIN
     SET (data, m, v, grad, step) = (
         SELECT s.weight, s.m, s.v, NULL::BYTEA, step_count
         FROM pg_llm_adamw_step(
-            data, grad, m, v,
+            data,
+            CASE
+                WHEN grad IS NULL OR grad_clip IS NULL OR grad_clip <= 0 THEN grad
+                ELSE pg_llm_grad_clip(grad, grad_clip)
+            END,
+            m, v,
             lr, beta1, beta2, eps, wd, step_count
         ) AS s
     )
@@ -308,7 +325,8 @@ CREATE OR REPLACE FUNCTION llm_train(
     eps FLOAT4 DEFAULT 1e-8,
     wd FLOAT4 DEFAULT 0.01,
     lr_max FLOAT4 DEFAULT 2.5e-4,
-    warmup INT DEFAULT 2000)
+    warmup INT DEFAULT 2000,
+    grad_clip FLOAT4 DEFAULT NULL)
 RETURNS VOID AS $$
 DECLARE
     loss FLOAT4;
@@ -342,7 +360,8 @@ BEGIN
             n_layer, n_head, D, vocab,
             dropout_p,
             beta1, beta2, eps, wd,
-            lr_max, warmup, n_steps);
+            lr_max, warmup, n_steps,
+            grad_clip);
 
         RAISE NOTICE 'step %/% loss=%', i, n_steps, loss;
     END LOOP;
@@ -356,6 +375,11 @@ CREATE UNLOGGED TABLE llm_tape (
     inputs INT[],          -- ids of parent tensors
     output INT,            -- id of output tensor
     extra JSONB            -- shape info, constants (e.g., eps, dims)
+);
+
+-- guard flag that toggles autograd recording
+CREATE UNLOGGED TABLE llm_autograd_mode (
+    flag BOOL NOT NULL
 );
 
 -- store actual data buffers
@@ -376,6 +400,46 @@ CREATE UNLOGGED TABLE llm_tensor_map (
     PRIMARY KEY (model, name, token_id)
 );
 
+CREATE OR REPLACE FUNCTION llm_materialize_params(p_model TEXT)
+RETURNS VOID AS $$
+DECLARE
+    rec RECORD;
+    tensor_name TEXT;
+    tensor_id INT;
+BEGIN
+    -- Clear cached tensors for this step
+    DELETE FROM llm_tensor;
+    DELETE FROM llm_tensor_map WHERE model = p_model;
+
+    -- Copy parameters into the tensor cache and create runtime tensors
+    FOR rec IN
+        SELECT name, token_id, data
+        FROM llm_param
+        WHERE model = p_model
+    LOOP
+        tensor_name := CASE
+                           WHEN rec.token_id = 0 THEN rec.name
+                           ELSE format('%s.%s', rec.name, rec.token_id)
+                       END;
+
+        INSERT INTO llm_tensor(name, data, requires_grad)
+        VALUES (tensor_name, rec.data, true)
+        ON CONFLICT (name) DO UPDATE
+            SET data = EXCLUDED.data,
+                requires_grad = EXCLUDED.requires_grad;
+
+        INSERT INTO llm_tensor_rt(data, grad, shape, requires_grad)
+        VALUES (rec.data, NULL, NULL, true)
+        RETURNING id INTO tensor_id;
+
+        INSERT INTO llm_tensor_map(model, name, token_id, tensor_id)
+        VALUES (p_model, rec.name, rec.token_id, tensor_id)
+        ON CONFLICT (model, name, token_id) DO UPDATE
+            SET tensor_id = EXCLUDED.tensor_id;
+    END LOOP;
+END;
+$$ LANGUAGE plpgsql;
+
 CREATE OR REPLACE FUNCTION llm_accumulate_grads(p_model TEXT)
 RETURNS VOID AS $$
 BEGIN
@@ -392,7 +456,8 @@ BEGIN
     WHERE p.model = p_model
       AND p.model = m.model
       AND p.name = m.name
-      AND p.token_id = m.token_id;
+      AND p.token_id = m.token_id
+      AND t.grad IS NOT NULL;
 END;
 $$ LANGUAGE plpgsql;
 
@@ -443,30 +508,6 @@ RETURNS void
 AS 'MODULE_PATHNAME', 'pg_llm_import_npz'
 LANGUAGE C STRICT;
 
-PG_FUNCTION_INFO_V1(pg_llm_export_npz);
-Datum pg_llm_export_npz(PG_FUNCTION_ARGS)
-{
-    text *path_t = PG_GETARG_TEXT_P(0);
-    text *model_t= PG_GETARG_TEXT_P(1);
-    char *path=text_to_cstring(path_t);
-    char *model=text_to_cstring(model_t);
-
-    SPI_connect();
-    gzFile fp=gzopen(path,"wb");
-    if(!fp) ereport(ERROR,(errmsg("cannot open %s",path)));
-
-    SPI_execute("SELECT name,data FROM llm_param WHERE model=$1",true,0);
-
-    for(uint64 i=0;i<SPI_processed;++i){
-        HeapTuple t=SPI_tuptable->vals[i];
-        char *name=TextDatumGetCString(SPI_getbinval(t,SPI_tuptable->tupdesc,1,NULL));
-        bytea *b=(bytea*)DatumGetPointer(SPI_getbinval(t,SPI_tuptable->tupdesc,2,NULL));
-        write_npz_entry(fp,name,(float*)VARDATA_ANY(b),VARHDRSZ, nbytes(b)/sizeof(float));
-    }
-    gzclose(fp);
-    SPI_finish();
-    PG_RETURN_VOID();
-}
 CREATE FUNCTION pg_llm_export_npz(path TEXT, model TEXT)
 RETURNS void
 AS 'MODULE_PATHNAME', 'pg_llm_export_npz'

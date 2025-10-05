@@ -5,6 +5,7 @@ PG_FUNCTION_INFO_V1(pg_llm_gelu_backward);
 PG_FUNCTION_INFO_V1(pg_llm_softmax_backward);
 PG_FUNCTION_INFO_V1(pg_llm_layernorm_backward);
 PG_FUNCTION_INFO_V1(pg_llm_dropout_backward);
+PG_FUNCTION_INFO_V1(pg_llm_cross_entropy_backward);
 
 Datum
 pg_llm_gelu_backward(PG_FUNCTION_ARGS)
@@ -114,6 +115,54 @@ pg_llm_dropout_backward(PG_FUNCTION_ARGS)
         else
             dx[i] = 0.0f;
     }
+
+    PG_RETURN_BYTEA_P(out);
+}
+
+/* ----------------------------------------------------------
+ *  Cross-entropy backward
+ * ---------------------------------------------------------- */
+Datum
+pg_llm_cross_entropy_backward(PG_FUNCTION_ARGS)
+{
+    bytea *logits_b = PG_GETARG_BYTEA_P(0);
+    int target = PG_GETARG_INT32(1);
+
+    int n = float_length(logits_b, "pg_llm_cross_entropy_backward");
+    float *logits;
+    bytea *out;
+    float *dlogits;
+    float maxv;
+    float sum = 0.0f;
+
+    if (n == 0)
+        ereport(ERROR,
+                (errmsg("pg_llm_cross_entropy_backward requires a non-empty logits vector")));
+
+    if (target < 0 || target >= n)
+        ereport(ERROR,
+                (errmsg("pg_llm_cross_entropy_backward target index %d out of bounds", target)));
+
+    logits = as_float(logits_b);
+    out = bytea_same_size(logits_b);
+    dlogits = as_float(out);
+
+    maxv = logits[0];
+    for (int i = 1; i < n; ++i)
+        if (logits[i] > maxv)
+            maxv = logits[i];
+
+    for (int i = 0; i < n; ++i) {
+        float ex = expf(logits[i] - maxv);
+        dlogits[i] = ex;
+        sum += ex;
+    }
+
+    float inv_sum = 1.0f / sum;
+    for (int i = 0; i < n; ++i)
+        dlogits[i] *= inv_sum;
+
+    dlogits[target] -= 1.0f;
 
     PG_RETURN_BYTEA_P(out);
 }
