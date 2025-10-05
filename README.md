@@ -15,6 +15,18 @@ The project demonstrates that a relational database can serve as a full numerica
 
 ---
 
+## Prerequisites
+
+Building the extension requires the PostgreSQL server development headers and build tooling so that `pg_config --pgxs` resolves to the `pgxs.mk` makefile. On Debian/Ubuntu systems install the package:
+
+```bash
+sudo apt-get install postgresql-server-dev-16
+```
+
+If PostgreSQL is installed somewhere custom, set the `PG_CONFIG` environment variable to point at the desired `pg_config` binary before running `make`.
+
+---
+
 ## Core Design Principles
 
 1. **Postgres as OS** — All computation and persistence live in SQL schemas and C extensions.
