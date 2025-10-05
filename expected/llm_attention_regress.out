@@ -5,45 +5,46 @@ CREATE FUNCTION
 CREATE FUNCTION
 CREATE FUNCTION
 CREATE FUNCTION
+CREATE FUNCTION
 
 label          | actual_hex                       | expected_hex                     | matches
 ---------------+----------------------------------+----------------------------------+--------
-matmul forward | b17b084034ae813fe500ec3f56c1283f | b17b084034ae813fe500ec3f56c1283f | t      
+matmul forward | b17b084034ae813fe500ec3f56c1283f | b17b084034ae813fe500ec3f56c1283f | t
 (1 row)
 
 label       | actual_hex                       | expected_hex                     | matches
 ------------+----------------------------------+----------------------------------+--------
-add forward | 0000a0bf000080bf0000a8400000803f | 0000a0bf000080bf0000a8400000803f | t      
+add forward | 0000a0bf000080bf0000a8400000803f | 0000a0bf000080bf0000a8400000803f | t
 (1 row)
 
 label        | actual_hex                               | expected_hex                             | matches
 -------------+------------------------------------------+------------------------------------------+--------
-gelu forward | 867622bea2f81dbe00000000af03b13e5e62573f | 867622bea2f81dbe00000000af03b13e5e62573f | t      
+gelu forward | 867622bea2f81dbe00000000af03b13e5e62573f | 867622bea2f81dbe00000000af03b13e5e62573f | t
 (1 row)
 
 label         | actual_hex                               | expected_hex                             | matches
 --------------+------------------------------------------+------------------------------------------+--------
-gelu backward | 48a1aabd5eaf87bd0000003e1e8fa6bf14aa0a40 | 48a1aabd5eaf87bd0000003e1e8fa6bf14aa0a40 | t      
+gelu backward | 48a1aabd5eaf87bd0000003e1e8fa6bf14aa0a40 | 48a1aabd5eaf87bd0000003e1e8fa6bf14aa0a40 | t
 (1 row)
 
 label           | actual_hex                       | expected_hex                     | matches
 ----------------+----------------------------------+----------------------------------+--------
-softmax forward | 4248803ea5604c3c36fd643d895a2e3f | 4248803ea5604c3c36fd643d895a2e3f | t      
+softmax forward | 4248803ea5604c3c36fd643d895a2e3f | 4248803ea5604c3c36fd643d895a2e3f | t
 (1 row)
 
 label            | actual_hex                       | expected_hex                     | matches
 -----------------+----------------------------------+----------------------------------+--------
-softmax backward | 196cdd3b82345fbb38c2a8ba914207bb | 196cdd3b82345fbb38c2a8ba914207bb | t      
+softmax backward | 196cdd3b82345fbb38c2a8ba914207bb | 196cdd3b82345fbb38c2a8ba914207bb | t
 (1 row)
 
 label             | actual_hex                       | expected_hex                     | matches
 ------------------+----------------------------------+----------------------------------+--------
-layernorm forward | cdcccc3dd69e153fbad0294019bdd8bd | cdcccc3dd69e153fbad0294019bdd8bd | t      
+layernorm forward | cdcccc3dd69e153fbad0294019bdd8bd | cdcccc3dd69e153fbad0294019bdd8bd | t
 (1 row)
 
 label              | dx_hex                           | expected_dx_hex                  | dgamma_hex                       | expected_dgamma_hex              | dbeta_hex                        | expected_dbeta_hex               | dx_match | dgamma_match | dbeta_match
 -------------------+----------------------------------+----------------------------------+----------------------------------+----------------------------------+----------------------------------+----------------------------------+----------+--------------+------------
-layernorm backward | 6007a0bff055893f59ab034042a5f0bf | 6007a0bff055893f59ab034042a5f0bf | 0000000009d2c8be879d963f8b06fbbe | 0000000009d2c8be879d963f8b06fbbe | 000000bf0000803e0000803f0000a0bf | 000000bf0000803e0000803f0000a0bf | t        | t            | t          
+layernorm backward | 6007a0bff055893f59ab034042a5f0bf | 6007a0bff055893f59ab034042a5f0bf | 0000000009d2c8be879d963f8b06fbbe | 0000000009d2c8be879d963f8b06fbbe | 000000bf0000803e0000803f0000a0bf | 000000bf0000803e0000803f0000a0bf | t        | t            | t
 (1 row)
 
 label         | actual_hex | expected_hex | matches
@@ -61,17 +62,60 @@ label                | actual_hex                       | expected_hex          
 dropout eval forward | 0000003f000080bf0000204000000000 | 0000003f000080bf0000204000000000 | t
 (1 row)
 
-label             | actual_hex                                                       | expected_hex                                                     | matches
+label             | actual_hex                       | expected_hex                     | matches
+------------------+----------------------------------+----------------------------------+--------
+dropout backward | 6edb363f000000006edb364000000000 | 6edb363f000000006edb364000000000 | t
+(1 row)
+
+label             | actual_hex                                                       | expected_hex                                                       | matches
 ------------------+------------------------------------------------------------------+------------------------------------------------------------------+--------
 attention forward | 0a0da13fa9bed03fe230c8bfa7e84abfafd9603f9a68bb3fdae9a7bf3ab6bfbe | 0a0da13fa9bed03fe230c8bfa7e84abfafd9603f9a68bb3fdae9a7bf3ab6bfbe | t
 (1 row)
 
-label               | dx_hex                           | expected_dx_hex                  | dw_qkv_hex                                                                                                                                    | expected_dw_qkv_hex                                                                                                                           | db_qkv_hex                       | expected_db_qkv_hex              | dw_o_hex                                                               | expected_dw_o_hex                                                      | db_o_hex                       | expected_db_o_hex                | dx_match | dw_qkv_match | db_qkv_match | dw_o_match | db_o_match
---------------------+----------------------------------+----------------------------------+----------------------------------------------------------------------------------------------------------------------------------------------+----------------------------------------------------------------------------------------------------------------------------------------------+----------------------------------+----------------------------------+------------------------------------------------------------------------+------------------------------------------------------------------------+----------------------------------+----------------------------------+----------+--------------+--------------+-----------+-----------
+CREATE TABLE
+INSERT 0 1
+
+label               | dx_hex                           | expected_dx_hex                  | dw_qkv_hex
+                                                                                                          | expected_dw_qkv_hex
+                                                                                                                          | db_qkv_hex                       | expected_db_qkv_hex              | dw_o_hex         | expected_dw_o_hex                                                      | db_o_hex                       | expected_db_o_hex                | dx_match | dw_qkv_match | db_qkv_match | dw_o_match | db_o_match
+--------------------+----------------------------------+----------------------------------+---------------------------------------------------------------------------------------------------------+------------------------------------------------------------------------------------------------------------------------+---------------------------+----------------------------------+-----------------------------------------------------------------------+------------------------------------------------------------------------+----------------------------------+----------------------------------+----------+--------------+--------------+-----------+-----------
 attention backward | b56d17c0044c2c401398f83e42c9993e048d00c0852805403efef2be6669b93f | b56d17c0044c2c401398f83e42c9993e048d00c0852805403efef2be6669b93f | 000000000000000044f9733ba32ce9bc00000000000000005c8ad9bcc7aa233dc8ffea3e45df3f3e516bbbbe7984f13e0000000000000000f3cb25ba8a769e3b00000000000000003a4a64bb0fc1ab3be6d302bef2a255bd4894f73cecd500bf0000000000000000b683173bead090bc0000000000000000ffa10a3de59950bd9036193fe4307a3e6a76d5bc803f3d400000000000000000ec2f1a3c235d93bd00000000000000007be6e0bc5c34293da123b43f7f14133f5f4744bfa7b45240 | 000000000000000044f9733ba32ce9bc00000000000000005c8ad9bcc7aa233dc8ffea3e45df3f3e516bbbbe7984f13e0000000000000000f3cb25ba8a769e3b00000000000000003a4a64bb0fc1ab3be6d302bef2a255bd4894f73cecd500bf0000000000000000b683173bead090bc0000000000000000ffa10a3de59950bd9036193fe4307a3e6a76d5bc803f3d400000000000000000ec2f1a3c235d93bd00000000000000007be6e0bc5c34293da123b43f7f14133f5f4744bfa7b45240 | 0000000000000000168bb43b0e8e2cbd00000000000000000000e03200008032c08d6c3f3424c13eb2ecc4bebacd3140 | 0000000000000000168bb43b0e8e2cbd00000000000000000000e03200008032c08d6c3f3424c13eb2ecc4bebacd3140 | bf4dcebe912dbf3f6d9ac83f97e99ebf341a053feaaff6bfad6c01c0a00dcd3fdd17f33ead17fdbfc4f6ffbf11b6d03fb11084bb55ff1ebe6450d5bde372f33d | bf4dcebe912dbf3f6d9ac83f97e99ebf341a053feaaff6bfad6c01c0a00dcd3fdd17f33ead17fdbfc4f6ffbf11b6d03fb11084bb55ff1ebe6450d5bde372f33d | ecb6e93e4194d8bfb441e3bfce06b43f | ecb6e93e4194d8bfb441e3bfce06b43f | t        | t            | t            | t         | t
 (1 row)
 
-label         | dx_hex                           | expected_dx_hex                  | dw_fc_hex                                                                                                                                    | expected_dw_fc_hex                                                                                                                            | db_fc_hex                       | expected_db_fc_hex              | dw_proj_hex                                                                                                                                | expected_dw_proj_hex                                                                                                                        | db_proj_hex                    | expected_db_proj_hex             | dx_match | dw_fc_match | db_fc_match | dw_proj_match | db_proj_match
---------------+----------------------------------+----------------------------------+----------------------------------------------------------------------------------------------------------------------------------------------+----------------------------------------------------------------------------------------------------------------------------------------------+----------------------------------+----------------------------------+--------------------------------------------------------------------------------------------------------------------------------------------+--------------------------------------------------------------------------------------------------------------------------------------------+----------------------------------+----------------------------------+----------+------------+------------+---------------+--------------
+label                             | dx_hex                           | expected_dx_hex                  | dw_qkv_hex
+                                                                                                          | expected_dw_qkv_hex
+                                                                                                                          | db_qkv_hex                       | expected_db_qkv_hex              | dw_o_hex         | expected_dw_o_hex                                                      | db_o_hex                       | expected_db_o_hex                | dx_match | dw_qkv_match | db_qkv_match | dw_o_match | db_o_match
+--------------------+----------------------------------+----------------------------------+---------------------------------------------------------------------------------------------------------+------------------------------------------------------------------------------------------------------------------------+---------------------------+----------------------------------+-----------------------------------------------------------------------+------------------------------------------------------------------------+----------------------------------+----------------------------------+----------+--------------+--------------+-----------+-----------
+attention backward (dy=ones) | 66cd34c177d83a4005e44bc0e11d6040aaf569bf48f46a3fb440243ff784ee3f | 66cd34c177d83a4005e44bc0e11d6040aaf569bf48f46a3fb440243ff784ee3f | 05c71e3c771f3bbdb2e74bbbbce0c23cd32b613e4422bd3e9a42bf3d77b67fbd3355073e6f791ec015cc0e40e7db943f2cc41e3c1b1c3bbd09e44bbb3cddc23c134cec3cab7a463df7b5483c8f2c06bcb2ea40bdafe7613f62f977bf194001bf3adb85bdbac09d3ea4e6ab3c664a24bed57e8fbe430ff1be19c5f3bd76f5a23d6bf1723e293e8ec0db20a3409e0d2a40061902bdc052193ef612273c6cad9fbd20ca683e7188c33e28bbc53da12e84bd87ade93e6cd108c1530f0941cbe08e40 | 05c71e3c771f3bbdb2e74bbbbce0c23cd32b613e4422bd3e9a42bf3d77b67fbd3355073e6f791ec015cc0e40e7db943f2cc41e3c1b1c3bbd09e44bbb3cddc23c134cec3cab7a463df7b5483c8f2c06bcb2ea40bdafe7613f62f977bf194001bf3adb85bdbac09d3ea4e6ab3c664a24bed57e8fbe430ff1be19c5f3bd76f5a23d6bf1723e293e8ec0db20a3409e0d2a40061902bdc052193ef612273c6cad9fbd20ca683e7188c33e28bbc53da12e84bd87ade93e6cd108c1530f0941cbe08e40 | dc8529bd64c9473e60b4593c0411d0bd0000003400008034000080b200000032002ea23e77e9bdc0216bc64067d74e40 | dc8529bd64c9473e60b4593c0411d0bd0000003400008034000080b200000032002ea23e77e9bdc0216bc64067d74e40 | 505faabf505faabf505faabf505faabf58c60a4058c60a4058c60a4058c60a40766f1a40766f1a40766f1a40766f1a407cc6783e7cc6783e7cc6783e7cc6783e | 505faabf505faabf505faabf505faabf58c60a4058c60a4058c60a4058c60a40766f1a40766f1a40766f1a40766f1a407cc6783e7cc6783e7cc6783e7cc6783e | 00000040000000400000004000000040 | 00000040000000400000004000000040 | t        | t            | t            | t         | t
+(1 row)
+
+CREATE TABLE
+CREATE TABLE
+CREATE TABLE
+TRUNCATE TABLE
+TRUNCATE TABLE
+DELETE 0
+INSERT 0 1
+
+label                        | calls
+-----------------------------+-------
+autograd attention forward   |     1
+(1 row)
+
+DO
+
+label                             | dx_hex                           | expected_dx_hex                  | dw_qkv_hex
+                                                                                                          | expected_dw_qkv_hex
+                                                                                                                          | db_qkv_hex                       | expected_db_qkv_hex              | dw_o_hex         | expected_dw_o_hex                                                      | db_o_hex                       | expected_db_o_hex                | dx_match | dw_qkv_match | db_qkv_match | dw_o_match | db_o_match
+--------------------+----------------------------------+----------------------------------+---------------------------------------------------------------------------------------------------------+------------------------------------------------------------------------------------------------------------------------+---------------------------+----------------------------------+-----------------------------------------------------------------------+------------------------------------------------------------------------+----------------------------------+----------------------------------+----------+--------------+--------------+-----------+-----------
+llm_backprop attention (dy=ones) | 66cd34c177d83a4005e44bc0e11d6040aaf569bf48f46a3fb440243ff784ee3f | 66cd34c177d83a4005e44bc0e11d6040aaf569bf48f46a3fb440243ff784ee3f | 05c71e3c771f3bbdb2e74bbbbce0c23cd32b613e4422bd3e9a42bf3d77b67fbd3355073e6f791ec015cc0e40e7db943f2cc41e3c1b1c3bbd09e44bbb3cddc23c134cec3cab7a463df7b5483c8f2c06bcb2ea40bdafe7613f62f977bf194001bf3adb85bdbac09d3ea4e6ab3c664a24bed57e8fbe430ff1be19c5f3bd76f5a23d6bf1723e293e8ec0db20a3409e0d2a40061902bdc052193ef612273c6cad9fbd20ca683e7188c33e28bbc53da12e84bd87ade93e6cd108c1530f0941cbe08e40 | 05c71e3c771f3bbdb2e74bbbbce0c23cd32b613e4422bd3e9a42bf3d77b67fbd3355073e6f791ec015cc0e40e7db943f2cc41e3c1b1c3bbd09e44bbb3cddc23c134cec3cab7a463df7b5483c8f2c06bcb2ea40bdafe7613f62f977bf194001bf3adb85bdbac09d3ea4e6ab3c664a24bed57e8fbe430ff1be19c5f3bd76f5a23d6bf1723e293e8ec0db20a3409e0d2a40061902bdc052193ef612273c6cad9fbd20ca683e7188c33e28bbc53da12e84bd87ade93e6cd108c1530f0941cbe08e40 | dc8529bd64c9473e60b4593c0411d0bd0000003400008034000080b200000032002ea23e77e9bdc0216bc64067d74e40 | dc8529bd64c9473e60b4593c0411d0bd0000003400008034000080b200000032002ea23e77e9bdc0216bc64067d74e40 | 505faabf505faabf505faabf505faabf58c60a4058c60a4058c60a4058c60a40766f1a40766f1a40766f1a40766f1a407cc6783e7cc6783e7cc6783e7cc6783e | 505faabf505faabf505faabf505faabf58c60a4058c60a4058c60a4058c60a40766f1a40766f1a40766f1a40766f1a407cc6783e7cc6783e7cc6783e7cc6783e | 00000040000000400000004000000040 | 00000040000000400000004000000040 | t        | t            | t            | t         | t
+(1 row)
+
+DELETE 1
+
+label         | dx_hex                           | expected_dx_hex                  | dw_fc_hex
+                                                                                                   | expected_dw_fc_hex
+                                                                                                                   | db_fc_hex                     | expected_db_fc_hex              | dw_proj_hex                                                                    | expected_dw_proj_hex                                                                                  | db_proj_hex                    | expected_db_proj_hex             | dx_match | dw_fc_match | db_fc_match | dw_proj_match | db_proj_match
+--------------+----------------------------------+----------------------------------+-------------------------------------------+---------------------------------------------------------------------------------------------------+----------------------------+----------------------------------+-----------------------------------------------------------------------+---------------------------------------------------------------------+----------------------------------------------------------+----------------------------------+----------------------------------+----------+------------+------------+---------------+--------------
 mlp backward | 307968404735f540bd559540b7d07fc027ed27c0d18721c1ea15813f8380053f | 307968404735f540bd559540b7d07fc027ed27c0d18721c1ea15813f8380053f | ef4c89befe8306bd3d4a0fc0cecdd93ea0e21fbece18023c5754313e3e308d3db8499cbbdda8fe3f00d92c40d6dbccbdd48e6840a9d9673b8ea9efbf9940f2bfbf4cf03d0c8d3b3c520a663e015b6b3e2cad1d3d1b0ad5bb1ae093bd2f5835bc5076ab3b279caabebf1a74bedd8d783c7c220cbfc37f0bbc1e11933e6046ac3ea054d3be63ee2dbd21beadbf82fcfdbe3a9b21beadbaa83c7b6b833e263c5a3d3a6f83bc63b3c93f1709c63f5d4999bdb95b2d40fd7eca3ce97cb4bf44c6c6bf706f93be4686f8bc2cc790bfa7837abe5862f0bd7b555f3ce242383e80532b3d93d22abcee7c9d3fda9aa73f037272bdeb360940b0b57e3c21868ebf69059abf | ef4c89befe8306bd3d4a0fc0cecdd93ea0e21fbece18023c5754313e3e308d3db8499cbbdda8fe3f00d92c40d6dbccbdd48e6840a9d9673b8ea9efbf9940f2bfbf4cf03d0c8d3b3c520a663e015b6b3e2cad1d3d1b0ad5bb1ae093bd2f5835bc5076ab3b279caabebf1a74bedd8d783c7c220cbfc37f0bbc1e11933e6046ac3ea054d3be63ee2dbd21beadbf82fcfdbe3a9b21beadbaa83c7b6b833e263c5a3d3a6f83bc63b3c93f1709c63f5d4999bdb95b2d40fd7eca3ce97cb4bf44c6c6bf706f93be4686f8bc2cc790bfa7837abe5862f0bd7b555f3ce242383e80532b3d93d22abcee7c9d3fda9aa73f037272bdeb360940b0b57e3c21868ebf69059abf | 767d5b3ff03ca13d18f3bd3e3b4a1840aaa66c3e177557bd7f8805bf04a647bd514c323d9ceec3bf70191ebeea77803d6ab60fc0e96d97bdbd0f9a3f6bcfd03f | 767d5b3ff03ca13d18f3bd3e3b4a1840aaa66c3e177557bd7f8805bf04a647bd514c323d9ceec3bf70191ebeea77803d6ab60fc0e96d97bdbd0f9a3f6bcfd03f | 477ccbbcb36c053d8d88003e06aca13d7c65463d306a6dbca556bc3da5582c3c8877b03f343d88bf0b0feebf8692f1bf11b33dbfa3e6d43eddb596bd3b01fb3ede19bebd20668e3d0377e23d6897f53d1d21423e31fed0bda215473df814e3bd05b777bd8e4b573d75acf93d3fe3d13d56b8d23c9e994dbcf0047e3cd5322fbce994813c268c0bbcd847843be8b917bc99bad83f37d88abfef9241bf872ac9bf5f3cc3be3022e23da9c63fbf26c1c2bd4e06173e49dc98bd293f903d510890bdb1b0ea3ff20c98bf2ef568bf9b89dfbf18a96b3b9221903cb34a0a3ef1d9813dac78e83ef1eeb1be758117bf03881cbfef9a5d40f85a0fc081fad8bf105852c0 | 477ccbbcb36c053d8d88003e06aca13d7c65463d306a6dbca556bc3da5582c3c8877b03f343d88bf0b0feebf8692f1bf11b33dbfa3e6d43eddb596bd3b01fb3ede19bebd20668e3d0377e23d6897f53d1d21423e31fed0bda215473df814e3bd05b777bd8e4b573d75acf93d3fe3d13d56b8d23c9e994dbcf0047e3cd5322fbce994813c268c0bbcd847843be8b917bc99bad83f37d88abfef9241bf872ac9bf5f3cc3be3022e23da9c63fbf26c1c2bd4e06173e49dc98bd293f903d510890bdb1b0ea3ff20c98bf2ef568bf9b89dfbf18a96b3b9221903cb34a0a3ef1d9813dac78e83ef1eeb1be758117bf03881cbfef9a5d40f85a0fc081fad8bf105852c0 | 00ed443d647b25be18796bbf147cf7be | 00ed443d647b25be18796bbf147cf7be | t        | t          | t          | t             | t
 (1 row)
