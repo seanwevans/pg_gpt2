@@ -28,6 +28,11 @@ RETURNS FLOAT4
 AS 'MODULE_PATHNAME', 'pg_llm_cross_entropy'
 LANGUAGE C STRICT;
 
+CREATE FUNCTION pg_llm_cross_entropy_backward(logits BYTEA, target INT)
+RETURNS BYTEA
+AS 'MODULE_PATHNAME', 'pg_llm_cross_entropy_backward'
+LANGUAGE C STRICT;
+
 CREATE FUNCTION pg_llm_dropout(input BYTEA, p FLOAT4, training BOOLEAN DEFAULT false)
 RETURNS BYTEA
 AS 'MODULE_PATHNAME', 'pg_llm_dropout'
