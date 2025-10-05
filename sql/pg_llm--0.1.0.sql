@@ -31,7 +31,9 @@ LANGUAGE C STRICT;
 CREATE FUNCTION pg_llm_attention(
     x BYTEA,
     w_qkv BYTEA,
+    b_qkv BYTEA,
     w_o BYTEA,
+    b_o BYTEA,
     n_head INT,
     T INT,
     D INT)
