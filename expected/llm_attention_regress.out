@@ -1,0 +1,59 @@
+SET
+CREATE FUNCTION
+CREATE FUNCTION
+CREATE FUNCTION
+
+label          | actual_hex                       | expected_hex                     | matches
+---------------+----------------------------------+----------------------------------+--------
+matmul forward | b17b084034ae813fe500ec3f56c1283f | b17b084034ae813fe500ec3f56c1283f | t      
+(1 row)
+
+label       | actual_hex                       | expected_hex                     | matches
+------------+----------------------------------+----------------------------------+--------
+add forward | 0000a0bf000080bf0000a8400000803f | 0000a0bf000080bf0000a8400000803f | t      
+(1 row)
+
+label        | actual_hex                               | expected_hex                             | matches
+-------------+------------------------------------------+------------------------------------------+--------
+gelu forward | 867622bea2f81dbe00000000af03b13e5e62573f | 867622bea2f81dbe00000000af03b13e5e62573f | t      
+(1 row)
+
+label         | actual_hex                               | expected_hex                             | matches
+--------------+------------------------------------------+------------------------------------------+--------
+gelu backward | 48a1aabd5eaf87bd0000003e1e8fa6bf14aa0a40 | 48a1aabd5eaf87bd0000003e1e8fa6bf14aa0a40 | t      
+(1 row)
+
+label           | actual_hex                       | expected_hex                     | matches
+----------------+----------------------------------+----------------------------------+--------
+softmax forward | 4248803ea5604c3c36fd643d895a2e3f | 4248803ea5604c3c36fd643d895a2e3f | t      
+(1 row)
+
+label            | actual_hex                       | expected_hex                     | matches
+-----------------+----------------------------------+----------------------------------+--------
+softmax backward | 196cdd3b82345fbb38c2a8ba914207bb | 196cdd3b82345fbb38c2a8ba914207bb | t      
+(1 row)
+
+label             | actual_hex                       | expected_hex                     | matches
+------------------+----------------------------------+----------------------------------+--------
+layernorm forward | cdcccc3dd69e153fbad0294019bdd8bd | cdcccc3dd69e153fbad0294019bdd8bd | t      
+(1 row)
+
+label              | dx_hex                           | expected_dx_hex                  | dgamma_hex                       | expected_dgamma_hex              | dbeta_hex                        | expected_dbeta_hex               | dx_match | dgamma_match | dbeta_match
+-------------------+----------------------------------+----------------------------------+----------------------------------+----------------------------------+----------------------------------+----------------------------------+----------+--------------+------------
+layernorm backward | 6007a0bff055893f59ab034042a5f0bf | 6007a0bff055893f59ab034042a5f0bf | 0000000009d2c8be879d963f8b06fbbe | 0000000009d2c8be879d963f8b06fbbe | 000000bf0000803e0000803f0000a0bf | 000000bf0000803e0000803f0000a0bf | t        | t            | t          
+(1 row)
+
+label         | actual_hex | expected_hex | matches
+--------------+------------+--------------+--------
+cross entropy | 3128273e   | 3128273e     | t      
+(1 row)
+
+label                | actual_hex                       | expected_hex                     | matches
+---------------------+----------------------------------+----------------------------------+--------
+dropout eval forward | 0000003f000080bf0000204000000000 | 0000003f000080bf0000204000000000 | t      
+(1 row)
+
+label             | actual_hex                                                       | expected_hex                                                     | matches
+------------------+------------------------------------------------------------------+------------------------------------------------------------------+--------
+attention forward | 0a0da13fa9bed03fe230c8bfa7e84abfafd9603f9a68bb3fdae9a7bf3ab6bfbe | 0a0da13fa9bed03fe230c8bfa7e84abfafd9603f9a68bb3fdae9a7bf3ab6bfbe | t      
+(1 row)

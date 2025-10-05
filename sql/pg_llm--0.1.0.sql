@@ -91,6 +91,15 @@ CREATE TABLE llm_param (
     PRIMARY KEY (model, name, token_id)
 );
 
+-- Materialized tensors used during the forward pass (activations, cached weights)
+CREATE UNLOGGED TABLE llm_tensor (
+    id SERIAL PRIMARY KEY,
+    name TEXT UNIQUE,
+    data BYTEA,
+    shape INT[],
+    requires_grad BOOL DEFAULT false
+);
+
 CREATE TABLE llm_train_log (
     model TEXT,
     step INT,
@@ -179,31 +188,56 @@ DECLARE
     step_count INT;
     lr FLOAT4;
     loss FLOAT4;
+    tape_top INT;
 BEGIN
-    SELECT tokens, target INTO seq, target FROM llm_dataset WHERE id=batch_id;
-    SELECT MAX(step) + 1 INTO step_count FROM llm_param WHERE model=model;
+    SELECT tokens, target INTO seq, target
+    FROM llm_dataset
+    WHERE id = batch_id;
+
+    IF seq IS NULL OR target IS NULL THEN
+        RAISE EXCEPTION 'No dataset row with id % for model %', batch_id, model;
+    END IF;
+
+    SELECT COALESCE(MAX(step), 0) + 1 INTO step_count
+    FROM llm_param
+    WHERE llm_param.model = model;
 
     lr := pg_llm_lr_schedule(step_count, warmup, total_steps, lr_max);
 
     loss := llm_loss(model, seq, target, n_layer, n_head, D, vocab,
                      dropout_p => dropout_p,
                      training => true);
+    -- Reset autograd state from the previous step
+    DELETE FROM llm_tape;
+    DELETE FROM llm_tensor_rt;
+    DELETE FROM llm_autograd_mode;
 
-    -- In a full implementation, populate llm_param.grad here
-    -- For now, assume gradients already in llm_param.grad.
+    -- Forward pass with autograd recording enabled
+    INSERT INTO llm_autograd_mode(flag) VALUES(true);
+    loss := llm_loss(model, seq, target, n_layer, n_head, D, vocab);
+    DELETE FROM llm_autograd_mode;
+
+    SELECT MAX(id) INTO tape_top FROM llm_tape;
+    IF tape_top IS NULL THEN
+        RAISE EXCEPTION 'Autograd tape empty after forward pass for step %', step_count;
+    END IF;
+
+    PERFORM llm_backprop(tape_top);
+    PERFORM llm_accumulate_grads(model);
 
     UPDATE llm_param
-    SET (data, m, v, step) = (
-        SELECT s.weight, s.m, s.v, step_count
+    SET (data, m, v, grad, step) = (
+        SELECT s.weight, s.m, s.v, NULL::BYTEA, step_count
         FROM pg_llm_adamw_step(
             data, grad, m, v,
             lr, beta1, beta2, eps, wd, step_count
         ) AS s
     )
-    WHERE model = llm_param.model AND name = llm_param.name;
+    WHERE llm_param.model = model;
 
     INSERT INTO llm_train_log(model, step, lr, loss)
     VALUES(model, step_count, lr, loss);
+
     RETURN loss;
 END;
 $$ LANGUAGE plpgsql;
@@ -265,14 +299,38 @@ CREATE OR REPLACE FUNCTION llm_train(
 RETURNS VOID AS $$
 DECLARE
     loss FLOAT4;
+    dataset_ids INT[];
+    dataset_size INT;
+    idx INT := 1;
+    batch_id INT;
 BEGIN
+    SELECT array_agg(id ORDER BY random()) INTO dataset_ids FROM llm_dataset;
+    dataset_size := COALESCE(array_length(dataset_ids, 1), 0);
+
+    IF dataset_size = 0 THEN
+        RAISE EXCEPTION 'llm_dataset is empty; cannot train model %', model;
+    END IF;
+
     FOR i IN 1..n_steps LOOP
+        IF idx > dataset_size THEN
+            SELECT array_agg(id ORDER BY random()) INTO dataset_ids FROM llm_dataset;
+            dataset_size := COALESCE(array_length(dataset_ids, 1), 0);
+            IF dataset_size = 0 THEN
+                RAISE EXCEPTION 'llm_dataset became empty during training for model %', model;
+            END IF;
+            idx := 1;
+        END IF;
+
+        batch_id := dataset_ids[idx];
+        idx := idx + 1;
+
         loss := llm_train_step(
-            model, (i % (SELECT COUNT(*) FROM llm_dataset))+1,
+            model, batch_id,
             n_layer, n_head, D, vocab,
             dropout_p,
             beta1, beta2, eps, wd,
             lr_max, warmup, n_steps);
+
         RAISE NOTICE 'step %/% loss=%', i, n_steps, loss;
     END LOOP;
 END;
@@ -296,15 +354,32 @@ CREATE UNLOGGED TABLE llm_tensor_rt (
     requires_grad BOOL DEFAULT false
 );
 
-CREATE OR REPLACE FUNCTION llm_accumulate_grads(model TEXT)
+-- Mapping from model parameters to runtime tensor ids for autograd
+CREATE UNLOGGED TABLE llm_tensor_map (
+    model TEXT,
+    name TEXT,
+    token_id INT DEFAULT 0 NOT NULL,
+    tensor_id INT REFERENCES llm_tensor_rt(id) ON DELETE CASCADE,
+    PRIMARY KEY (model, name, token_id)
+);
+
+CREATE OR REPLACE FUNCTION llm_accumulate_grads(p_model TEXT)
 RETURNS VOID AS $$
 BEGIN
+    -- Clear stale gradients for this model
+    UPDATE llm_param
+    SET grad = NULL
+    WHERE model = p_model;
+
+    -- Populate grads from runtime tensors recorded during autograd
     UPDATE llm_param p
-    SET grad = (
-        SELECT grad FROM llm_tensor_rt t
-        WHERE t.id = (SELECT id FROM llm_tensor_map WHERE model=p.model AND name=p.name)
-    )
-    WHERE model=p.model;
+    SET grad = t.grad
+    FROM llm_tensor_map m
+    JOIN llm_tensor_rt t ON t.id = m.tensor_id
+    WHERE p.model = p_model
+      AND p.model = m.model
+      AND p.name = m.name
+      AND p.token_id = m.token_id;
 END;
 $$ LANGUAGE plpgsql;
 
