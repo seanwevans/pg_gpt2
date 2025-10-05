@@ -66,6 +66,36 @@ If PostgreSQL is installed somewhere custom, set the `PG_CONFIG` environment var
 
 ---
 
+## Autograd Workflow
+
+End-to-end training relies on a thin runtime that records every forward op in SQL
+so that gradients can be replayed later. The key moving pieces are:
+
+1. **Parameter materialization.** `llm_materialize_params` copies each row in
+   `llm_param` into the temporary `llm_tensor` cache and creates a matching row
+   in `llm_tensor_rt`. During that copy the helper `pg_llm_autograd_map_param`
+   (or its SQL equivalent `INSERT` in the function) must be invoked so the runtime
+   tensor id is associated with the original `(model, name, token_id)` tuple. Any
+   new C routine that constructs parameter views needs to perform the same mapping
+   or gradients will not flow back into `llm_param`. 【F:sql/pg_llm--0.1.0.sql†L403-L438】【F:src/pg_llm_autograd.c†L216-L246】
+2. **Forward tape recording.** Every C kernel checks `pg_llm_autograd_enabled()`;
+   when the flag is set the inputs and outputs are registered with
+   `pg_llm_autograd_track_tensor` and the op is appended to `llm_tape` with any
+   metadata (shape, constants, etc.). This produces an ordered tape of all ops in
+   the forward pass. 【F:src/pg_llm.c†L19-L210】
+3. **Reverse traversal.** `llm_backprop` walks the tape from the newest node back
+   to the seed, dispatching gradients based on the recorded `name` field and
+   writing results into `llm_tensor_rt.grad`. Once complete, `llm_accumulate_grads`
+   copies those buffers back into `llm_param.grad` using the mapping created in
+   step 1. 【F:sql/llm_backprop.sql†L1-L78】【F:sql/pg_llm--0.1.0.sql†L439-L456】
+4. **Tied embeddings.** GPT-2 reuses the token embedding (`wte`) for the final
+   logits projection. After flattening the embedding table into a single matrix
+   for `pg_llm_matmul`, ensure that buffer is still mapped to the original
+   embedding rows (via `pg_llm_autograd_map_param`) so the logits gradient is
+   accumulated back into `wte` rather than a detached copy. 【F:sql/pg_llm--0.1.0.sql†L173-L205】【F:src/pg_llm_autograd.c†L216-L246】
+
+---
+
 ## SQL API Reference
 
 ### Model Initialization

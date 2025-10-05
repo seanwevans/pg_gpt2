@@ -11,6 +11,8 @@ BEGIN
     -- seed gradient of final output = 1
     UPDATE llm_tensor_rt SET grad = pg_llm_ones_like(data) WHERE id=start_id;
 
+    -- Replay the tape in reverse order.  Each op name recorded during the
+    -- forward pass determines which gradient kernel we invoke.
     FOR node IN SELECT * FROM llm_tape ORDER BY id DESC LOOP
         IF node.name='add' THEN
             UPDATE llm_tensor_rt
