@@ -376,6 +376,11 @@ CREATE UNLOGGED TABLE llm_tape (
     extra JSONB            -- shape info, constants (e.g., eps, dims)
 );
 
+-- guard flag that toggles autograd recording
+CREATE UNLOGGED TABLE llm_autograd_mode (
+    flag BOOL NOT NULL
+);
+
 -- store actual data buffers
 CREATE UNLOGGED TABLE llm_tensor_rt (
     id SERIAL PRIMARY KEY,
