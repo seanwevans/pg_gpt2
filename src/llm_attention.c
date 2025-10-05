@@ -193,3 +193,264 @@ Datum pg_llm_attention(PG_FUNCTION_ARGS)
 
     PG_RETURN_BYTEA_P(out);
 }
+
+PG_FUNCTION_INFO_V1(pg_llm_attention_backward);
+Datum
+pg_llm_attention_backward(PG_FUNCTION_ARGS)
+{
+    bytea *x_b     = PG_GETARG_BYTEA_P(0);
+    bytea *w_qkv_b = PG_GETARG_BYTEA_P(1);
+    bytea *b_qkv_b = PG_GETARG_BYTEA_P(2);
+    bytea *w_o_b   = PG_GETARG_BYTEA_P(3);
+    bytea *b_o_b   = PG_GETARG_BYTEA_P(4);
+    bytea *dy_b    = PG_GETARG_BYTEA_P(5);
+    int n_head     = PG_GETARG_INT32(6);
+    int64_t T      = PG_GETARG_INT32(7);
+    int64_t D      = PG_GETARG_INT32(8);
+
+    if (n_head <= 0 || D <= 0 || T <= 0)
+        ereport(ERROR, (errmsg("pg_llm_attention_backward requires positive dimensions")));
+    if (D % n_head != 0)
+        ereport(ERROR, (errmsg("model dimension must be divisible by number of heads")));
+
+    const int head_dim = (int) (D / n_head);
+    const float scale = 1.0f / sqrtf((float) head_dim);
+
+    float *x     = as_float(x_b);
+    float *w_qkv = as_float(w_qkv_b);
+    float *b_qkv = as_float(b_qkv_b);
+    float *w_o   = as_float(w_o_b);
+    float *dy    = as_float(dy_b);
+
+    Size qkv_elems = (Size) T * 3 * D;
+    Size td_elems = (Size) T * D;
+
+    float *qkv = (float *) palloc(qkv_elems * sizeof(float));
+    float *context = (float *) palloc(td_elems * sizeof(float));
+    memset(context, 0, td_elems * sizeof(float));
+
+    pg_llm_fast_gemm(x, w_qkv, qkv, (int) T, (int) D, (int) (3 * D));
+    for (int64_t t = 0; t < T; ++t) {
+        float *row = qkv + (Size) t * 3 * D;
+        for (int64_t j = 0; j < 3 * D; ++j)
+            row[j] += b_qkv[j];
+    }
+
+    float *Q = qkv;
+    float *K = qkv + (Size) T * D;
+    float *V = qkv + (Size) 2 * T * D;
+
+    float *attn = (float *) palloc0((Size) n_head * T * T * sizeof(float));
+
+    for (int h = 0; h < n_head; ++h) {
+        int off = h * head_dim;
+        float *attn_head = attn + (Size) h * T * T;
+        for (int64_t t = 0; t < T; ++t) {
+            float *row_attn = attn_head + (Size) t * T;
+            int valid = (int) (t + 1);
+            for (int64_t j = 0; j < valid; ++j) {
+                float dot = 0.0f;
+                const float *q_vec = Q + (Size) t * D + off;
+                const float *k_vec = K + (Size) j * D + off;
+                for (int d = 0; d < head_dim; ++d)
+                    dot += q_vec[d] * k_vec[d];
+                row_attn[j] = dot * scale;
+            }
+            for (int64_t j = valid; j < T; ++j)
+                row_attn[j] = 0.0f;
+
+            float maxv = -INFINITY;
+            for (int j = 0; j < valid; ++j)
+                if (row_attn[j] > maxv)
+                    maxv = row_attn[j];
+
+            float sum = 0.0f;
+            for (int j = 0; j < valid; ++j) {
+                float ex = expf(row_attn[j] - maxv);
+                row_attn[j] = ex;
+                sum += ex;
+            }
+            if (sum <= 0.0f)
+                sum = 1.0f;
+            float inv_sum = 1.0f / sum;
+            for (int j = 0; j < valid; ++j)
+                row_attn[j] *= inv_sum;
+        }
+
+        for (int64_t t = 0; t < T; ++t) {
+            float *dst = context + (Size) t * D + off;
+            float *attn_row = attn_head + (Size) t * T;
+            for (int d = 0; d < head_dim; ++d) {
+                float sum = 0.0f;
+                for (int64_t j = 0; j <= t; ++j) {
+                    float weight = attn_row[j];
+                    sum += weight * V[(Size) j * D + off + d];
+                }
+                dst[d] = sum;
+            }
+        }
+    }
+
+    bytea *dx_b = bytea_same_size(x_b);
+    bytea *dw_qkv_b = bytea_same_size(w_qkv_b);
+    bytea *db_qkv_b = bytea_same_size(b_qkv_b);
+    bytea *dw_o_b_out = bytea_same_size(w_o_b);
+    bytea *db_o_b_out = bytea_same_size(b_o_b);
+
+    float *dx = as_float(dx_b);
+    float *dw_qkv_out = as_float(dw_qkv_b);
+    float *db_qkv_out = as_float(db_qkv_b);
+    float *dw_o_out = as_float(dw_o_b_out);
+    float *db_o_out = as_float(db_o_b_out);
+
+    memset(dx, 0, td_elems * sizeof(float));
+    memset(dw_qkv_out, 0, ((Size) D * 3 * D) * sizeof(float));
+    memset(db_qkv_out, 0, ((Size) 3 * D) * sizeof(float));
+    memset(dw_o_out, 0, ((Size) D * D) * sizeof(float));
+    memset(db_o_out, 0, ((Size) D) * sizeof(float));
+
+    float *d_context = (float *) palloc0(td_elems * sizeof(float));
+
+    for (int64_t t = 0; t < T; ++t) {
+        const float *dy_row = dy + (Size) t * D;
+        float *ctx_row = context + (Size) t * D;
+        float *dctx_row = d_context + (Size) t * D;
+
+        for (int64_t j = 0; j < D; ++j)
+            db_o_out[j] += dy_row[j];
+
+        for (int64_t i = 0; i < D; ++i)
+            for (int64_t j = 0; j < D; ++j)
+                dw_o_out[(Size) i * D + j] += ctx_row[i] * dy_row[j];
+
+        for (int64_t i = 0; i < D; ++i) {
+            float sum = 0.0f;
+            for (int64_t j = 0; j < D; ++j)
+                sum += dy_row[j] * w_o[(Size) i * D + j];
+            dctx_row[i] = sum;
+        }
+    }
+
+    float *dQ = (float *) palloc0(td_elems * sizeof(float));
+    float *dK = (float *) palloc0(td_elems * sizeof(float));
+    float *dV = (float *) palloc0(td_elems * sizeof(float));
+
+    float *dqkv = (float *) palloc0(qkv_elems * sizeof(float));
+
+    for (int h = 0; h < n_head; ++h) {
+        int off = h * head_dim;
+        float *attn_head = attn + (Size) h * T * T;
+        float *dP = (float *) palloc0((Size) T * T * sizeof(float));
+        float *dS = (float *) palloc0((Size) T * T * sizeof(float));
+
+        for (int64_t t = 0; t < T; ++t) {
+            const float *dctx_row = d_context + (Size) t * D + off;
+            const float *attn_row = attn_head + (Size) t * T;
+            for (int64_t j = 0; j <= t; ++j) {
+                float dot = 0.0f;
+                const float *v_vec = V + (Size) j * D + off;
+                for (int d = 0; d < head_dim; ++d)
+                    dot += dctx_row[d] * v_vec[d];
+                dP[(Size) t * T + j] = dot;
+                for (int d = 0; d < head_dim; ++d)
+                    dV[(Size) j * D + off + d] += attn_row[j] * dctx_row[d];
+            }
+        }
+
+        for (int64_t t = 0; t < T; ++t) {
+            int valid = (int) (t + 1);
+            const float *attn_row = attn_head + (Size) t * T;
+            float sum = 0.0f;
+            for (int j = 0; j < valid; ++j)
+                sum += attn_row[j] * dP[(Size) t * T + j];
+            for (int j = 0; j < valid; ++j) {
+                float grad = attn_row[j] * (dP[(Size) t * T + j] - sum);
+                dS[(Size) t * T + j] = grad;
+            }
+        }
+
+        for (int64_t t = 0; t < T; ++t) {
+            for (int64_t j = 0; j <= t; ++j) {
+                float grad = dS[(Size) t * T + j] * scale;
+                if (grad == 0.0f)
+                    continue;
+                const float *q_vec = Q + (Size) t * D + off;
+                const float *k_vec = K + (Size) j * D + off;
+                for (int d = 0; d < head_dim; ++d) {
+                    dQ[(Size) t * D + off + d] += grad * k_vec[d];
+                    dK[(Size) j * D + off + d] += grad * q_vec[d];
+                }
+            }
+        }
+
+        pfree(dP);
+        pfree(dS);
+    }
+
+    for (int64_t t = 0; t < T; ++t) {
+        float *dq_row = dqkv + (Size) t * 3 * D;
+        for (int h = 0; h < n_head; ++h) {
+            int off = h * head_dim;
+            memcpy(dq_row + off,
+                   dQ + (Size) t * D + off,
+                   (Size) head_dim * sizeof(float));
+            memcpy(dq_row + D + off,
+                   dK + (Size) t * D + off,
+                   (Size) head_dim * sizeof(float));
+            memcpy(dq_row + 2 * D + off,
+                   dV + (Size) t * D + off,
+                   (Size) head_dim * sizeof(float));
+        }
+    }
+
+    for (int64_t t = 0; t < T; ++t) {
+        for (int64_t j = 0; j < 3 * D; ++j)
+            db_qkv_out[j] += dqkv[(Size) t * 3 * D + j];
+    }
+
+    for (int64_t i = 0; i < D; ++i) {
+        for (int64_t j = 0; j < 3 * D; ++j) {
+            float sum = 0.0f;
+            for (int64_t t = 0; t < T; ++t)
+                sum += x[(Size) t * D + i] * dqkv[(Size) t * 3 * D + j];
+            dw_qkv_out[(Size) i * 3 * D + j] = sum;
+        }
+    }
+
+    for (int64_t t = 0; t < T; ++t) {
+        for (int64_t i = 0; i < D; ++i) {
+            float sum = 0.0f;
+            for (int64_t j = 0; j < 3 * D; ++j)
+                sum += dqkv[(Size) t * 3 * D + j] * w_qkv[(Size) i * 3 * D + j];
+            dx[(Size) t * D + i] = sum;
+        }
+    }
+
+    TupleDesc tupdesc;
+    Datum values[5];
+    bool nulls[5] = {false, false, false, false, false};
+
+    if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+        ereport(ERROR, (errmsg("expected composite return type")));
+
+    BlessTupleDesc(tupdesc);
+
+    values[0] = PointerGetDatum(dx_b);
+    values[1] = PointerGetDatum(dw_qkv_b);
+    values[2] = PointerGetDatum(db_qkv_b);
+    values[3] = PointerGetDatum(dw_o_b_out);
+    values[4] = PointerGetDatum(db_o_b_out);
+
+    HeapTuple rettuple = heap_form_tuple(tupdesc, values, nulls);
+
+    pfree(dqkv);
+    pfree(dV);
+    pfree(dK);
+    pfree(dQ);
+    pfree(d_context);
+    pfree(attn);
+    pfree(context);
+    pfree(qkv);
+
+    PG_RETURN_DATUM(HeapTupleGetDatum(rettuple));
+}
