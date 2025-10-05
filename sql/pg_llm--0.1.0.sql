@@ -76,6 +76,15 @@ RETURNS BYTEA
 AS 'MODULE_PATHNAME', 'pg_llm_attention'
 LANGUAGE C STRICT;
 
+CREATE FUNCTION pg_llm_autograd_map_param(
+    model TEXT,
+    name TEXT,
+    token_id INT,
+    tensor BYTEA,
+    shape INT[] DEFAULT NULL)
+RETURNS VOID
+AS 'MODULE_PATHNAME', 'pg_llm_autograd_map_param'
+LANGUAGE C;
 CREATE TYPE attention_grads AS (
     dx BYTEA,
     dw_qkv BYTEA,
@@ -447,7 +456,6 @@ RETURNS VOID AS $$
 DECLARE
     rec RECORD;
     tensor_name TEXT;
-    tensor_id INT;
 BEGIN
     -- Clear cached tensors for this step
     DELETE FROM llm_tensor;
