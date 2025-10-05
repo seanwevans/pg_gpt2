@@ -33,6 +33,19 @@ RETURNS BYTEA
 AS 'MODULE_PATHNAME', 'pg_llm_dropout'
 LANGUAGE C STRICT;
 
+CREATE FUNCTION pg_llm_ones_like(src BYTEA)
+RETURNS BYTEA
+AS 'MODULE_PATHNAME', 'pg_llm_ones_like'
+LANGUAGE C STRICT;
+
+CREATE FUNCTION pg_llm_zeros_like(src BYTEA)
+RETURNS BYTEA
+AS 'MODULE_PATHNAME', 'pg_llm_zeros_like'
+LANGUAGE C STRICT;
+
+CREATE FUNCTION pg_llm_transpose(src BYTEA, rows INT, cols INT)
+RETURNS BYTEA
+AS 'MODULE_PATHNAME', 'pg_llm_transpose'
 CREATE FUNCTION pg_llm_dropout_backward(
     input BYTEA,
     output BYTEA,
