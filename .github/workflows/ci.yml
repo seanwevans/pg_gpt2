@@ -19,6 +19,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential postgresql-server-dev-16
 
+      - name: Install clang-19
+        run: |
+          sudo apt-get install -y clang-19
+
       - name: Build extension
         run: |
           make
