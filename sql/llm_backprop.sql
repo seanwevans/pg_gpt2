@@ -26,11 +26,11 @@ BEGIN
             -- dA = dY @ Bᵀ, dB = Aᵀ @ dY
             UPDATE llm_tensor_rt
               SET grad = COALESCE(grad, pg_llm_zeros_like(data))
-                        + pg_llm_matmul(grad, pg_llm_transpose(b), m,n,k)
+                        + pg_llm_matmul(grad, pg_llm_transpose(b, k, n), m,n,k)
               WHERE id=node.inputs[1];
             UPDATE llm_tensor_rt
               SET grad = COALESCE(grad, pg_llm_zeros_like(data))
-                        + pg_llm_matmul(pg_llm_transpose(a), grad, k,m,n)
+                        + pg_llm_matmul(pg_llm_transpose(a, m, k), grad, k,m,n)
               WHERE id=node.inputs[2];
               ELSIF node.name='softmax' THEN
     UPDATE llm_tensor_rt

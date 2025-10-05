@@ -11,6 +11,9 @@ PG_FUNCTION_INFO_V1(pg_llm_softmax);
 PG_FUNCTION_INFO_V1(pg_llm_layernorm);
 PG_FUNCTION_INFO_V1(pg_llm_cross_entropy);
 PG_FUNCTION_INFO_V1(pg_llm_dropout);
+PG_FUNCTION_INFO_V1(pg_llm_ones_like);
+PG_FUNCTION_INFO_V1(pg_llm_zeros_like);
+PG_FUNCTION_INFO_V1(pg_llm_transpose);
 
 /* ------------------ MATMUL ------------------ */
 Datum pg_llm_matmul(PG_FUNCTION_ARGS)
@@ -275,6 +278,53 @@ Datum pg_llm_dropout(PG_FUNCTION_ARGS)
         else
             dst[i] = src[i] * scale;
     }
+
+    PG_RETURN_BYTEA_P(out);
+}
+
+/* ------------------ TENSOR HELPERS ------------------ */
+Datum pg_llm_ones_like(PG_FUNCTION_ARGS)
+{
+    bytea *input = PG_GETARG_BYTEA_P(0);
+    bytea *out = bytea_constant_like(input, "pg_llm_ones_like", 1.0f);
+    PG_RETURN_BYTEA_P(out);
+}
+
+Datum pg_llm_zeros_like(PG_FUNCTION_ARGS)
+{
+    bytea *input = PG_GETARG_BYTEA_P(0);
+    bytea *out = bytea_constant_like(input, "pg_llm_zeros_like", 0.0f);
+    PG_RETURN_BYTEA_P(out);
+}
+
+Datum pg_llm_transpose(PG_FUNCTION_ARGS)
+{
+    bytea *input = PG_GETARG_BYTEA_P(0);
+    int rows = PG_GETARG_INT32(1);
+    int cols = PG_GETARG_INT32(2);
+    size_t expected_bytes;
+    bytea *out;
+    float *src;
+    float *dst;
+
+    if (rows <= 0 || cols <= 0)
+        ereport(ERROR,
+                (errmsg("pg_llm_transpose requires positive dimensions (got %d x %d)",
+                        rows, cols)));
+
+    expected_bytes = (size_t) rows * cols * sizeof(float);
+    if (nbytes(input) != expected_bytes)
+        ereport(ERROR,
+                (errmsg("pg_llm_transpose expected %d x %d matrix (%zu bytes)",
+                        rows, cols, expected_bytes)));
+
+    out = bytea_alloc(expected_bytes);
+    src = as_float(input);
+    dst = as_float(out);
+
+    for (int i = 0; i < rows; i++)
+        for (int j = 0; j < cols; j++)
+            dst[j * rows + i] = src[i * cols + j];
 
     PG_RETURN_BYTEA_P(out);
 }
