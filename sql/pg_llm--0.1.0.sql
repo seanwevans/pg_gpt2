@@ -81,6 +81,15 @@ CREATE TABLE llm_param (
     PRIMARY KEY (model, name, token_id)
 );
 
+-- Materialized tensors used during the forward pass (activations, cached weights)
+CREATE UNLOGGED TABLE llm_tensor (
+    id SERIAL PRIMARY KEY,
+    name TEXT UNIQUE,
+    data BYTEA,
+    shape INT[],
+    requires_grad BOOL DEFAULT false
+);
+
 CREATE TABLE llm_train_log (
     model TEXT,
     step INT,
@@ -174,8 +183,8 @@ BEGIN
 
     loss := llm_loss(model, seq, target, n_layer, n_head, D, vocab);
 
-    -- In a full implementation, populate llm_param.grad here
-    -- For now, assume gradients already in llm_param.grad.
+    -- Pull accumulated gradients from the runtime tensors into llm_param
+    PERFORM llm_accumulate_grads(model);
 
     UPDATE llm_param
     SET (data, m, v, step) = (
@@ -279,15 +288,32 @@ CREATE UNLOGGED TABLE llm_tensor_rt (
     requires_grad BOOL DEFAULT false
 );
 
-CREATE OR REPLACE FUNCTION llm_accumulate_grads(model TEXT)
+-- Mapping from model parameters to runtime tensor ids for autograd
+CREATE UNLOGGED TABLE llm_tensor_map (
+    model TEXT,
+    name TEXT,
+    token_id INT DEFAULT 0 NOT NULL,
+    tensor_id INT REFERENCES llm_tensor_rt(id) ON DELETE CASCADE,
+    PRIMARY KEY (model, name, token_id)
+);
+
+CREATE OR REPLACE FUNCTION llm_accumulate_grads(p_model TEXT)
 RETURNS VOID AS $$
 BEGIN
+    -- Clear stale gradients for this model
+    UPDATE llm_param
+    SET grad = NULL
+    WHERE model = p_model;
+
+    -- Populate grads from runtime tensors recorded during autograd
     UPDATE llm_param p
-    SET grad = (
-        SELECT grad FROM llm_tensor_rt t
-        WHERE t.id = (SELECT id FROM llm_tensor_map WHERE model=p.model AND name=p.name)
-    )
-    WHERE model=p.model;
+    SET grad = t.grad
+    FROM llm_tensor_map m
+    JOIN llm_tensor_rt t ON t.id = m.tensor_id
+    WHERE p.model = p_model
+      AND p.model = m.model
+      AND p.name = m.name
+      AND p.token_id = m.token_id;
 END;
 $$ LANGUAGE plpgsql;
 
