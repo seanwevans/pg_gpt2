@@ -33,6 +33,16 @@ RETURNS BYTEA
 AS 'MODULE_PATHNAME', 'pg_llm_dropout'
 LANGUAGE C STRICT;
 
+CREATE FUNCTION pg_llm_dropout_backward(
+    input BYTEA,
+    output BYTEA,
+    grad BYTEA,
+    p FLOAT4,
+    training BOOLEAN)
+RETURNS BYTEA
+AS 'MODULE_PATHNAME', 'pg_llm_dropout_backward'
+LANGUAGE C STRICT;
+
 CREATE FUNCTION pg_llm_attention(
     x BYTEA,
     w_qkv BYTEA,
@@ -115,7 +125,9 @@ CREATE OR REPLACE FUNCTION llm_loss(
     n_layer INT,
     n_head INT,
     D INT,
-    vocab INT)
+    vocab INT,
+    dropout_p FLOAT4 DEFAULT 0.1,
+    training BOOLEAN DEFAULT true)
 RETURNS FLOAT4 AS $$
 DECLARE
     x BYTEA;
@@ -134,8 +146,8 @@ BEGIN
         D,
         (SELECT data FROM llm_param p WHERE p.model = model AND p.name = 'ln_f.weight'),
         (SELECT data FROM llm_param p WHERE p.model = model AND p.name = 'ln_f.bias'),
-        dropout_p => 0.1::float4,
-        training => true);
+        dropout_p => dropout_p,
+        training => training);
 
     -- 3. Final linear projection (tie weights with token_emb)
     logits := pg_llm_matmul(x,
@@ -161,6 +173,7 @@ CREATE OR REPLACE FUNCTION llm_train_step(
     n_head INT,
     D INT,
     vocab INT,
+    dropout_p FLOAT4 DEFAULT 0.1,
     beta1 FLOAT4,
     beta2 FLOAT4,
     eps FLOAT4,
@@ -191,6 +204,9 @@ BEGIN
 
     lr := pg_llm_lr_schedule(step_count, warmup, total_steps, lr_max);
 
+    loss := llm_loss(model, seq, target, n_layer, n_head, D, vocab,
+                     dropout_p => dropout_p,
+                     training => true);
     -- Reset autograd state from the previous step
     DELETE FROM llm_tape;
     DELETE FROM llm_tensor_rt;
@@ -273,6 +289,7 @@ CREATE OR REPLACE FUNCTION llm_train(
     n_head INT,
     D INT,
     vocab INT,
+    dropout_p FLOAT4 DEFAULT 0.1,
     beta1 FLOAT4 DEFAULT 0.9,
     beta2 FLOAT4 DEFAULT 0.999,
     eps FLOAT4 DEFAULT 1e-8,
@@ -310,6 +327,7 @@ BEGIN
         loss := llm_train_step(
             model, batch_id,
             n_layer, n_head, D, vocab,
+            dropout_p,
             beta1, beta2, eps, wd,
             lr_max, warmup, n_steps);
 

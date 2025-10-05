@@ -30,7 +30,9 @@ BEGIN
 
     -- 2. Self-Attention
     attn := pg_llm_attention(x, w_qkv, b_qkv, w_o, b_o, n_head, T, D);
-    attn := pg_llm_dropout(attn, dropout_p, training);
+    IF training AND dropout_p > 0 THEN
+        attn := pg_llm_dropout(attn, dropout_p, training);
+    END IF;
     x := pg_llm_add(input, attn);  -- residual 1
 
     -- 3. LayerNorm
@@ -43,7 +45,9 @@ BEGIN
     mlp := pg_llm_gelu(mlp);
     mlp := pg_llm_matmul(mlp, w_proj, T, 4*D, D);
     mlp := pg_llm_add(mlp, b_proj);
-    mlp := pg_llm_dropout(mlp, dropout_p, training);
+    IF training AND dropout_p > 0 THEN
+        mlp := pg_llm_dropout(mlp, dropout_p, training);
+    END IF;
 
     x := pg_llm_add(residual2, mlp);       -- residual 2
     RETURN x;
