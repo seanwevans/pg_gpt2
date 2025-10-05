@@ -118,6 +118,11 @@ CREATE UNLOGGED TABLE llm_tensor (
     requires_grad BOOL DEFAULT false
 );
 
+-- Single-row toggle to enable/disable autograd recording during forward passes
+CREATE UNLOGGED TABLE llm_autograd_mode (
+    flag BOOLEAN PRIMARY KEY
+);
+
 CREATE TABLE llm_train_log (
     model TEXT,
     step INT,
