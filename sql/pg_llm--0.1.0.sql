@@ -51,6 +51,8 @@ LANGUAGE C STRICT;
 CREATE FUNCTION pg_llm_transpose(src BYTEA, rows INT, cols INT)
 RETURNS BYTEA
 AS 'MODULE_PATHNAME', 'pg_llm_transpose'
+LANGUAGE C STRICT;
+
 CREATE FUNCTION pg_llm_dropout_backward(
     input BYTEA,
     output BYTEA,
@@ -72,6 +74,28 @@ CREATE FUNCTION pg_llm_attention(
     D INT)
 RETURNS BYTEA
 AS 'MODULE_PATHNAME', 'pg_llm_attention'
+LANGUAGE C STRICT;
+
+CREATE TYPE attention_grads AS (
+    dx BYTEA,
+    dw_qkv BYTEA,
+    db_qkv BYTEA,
+    dw_o BYTEA,
+    db_o BYTEA
+);
+
+CREATE FUNCTION pg_llm_attention_backward(
+    x BYTEA,
+    w_qkv BYTEA,
+    b_qkv BYTEA,
+    w_o BYTEA,
+    b_o BYTEA,
+    grad_output BYTEA,
+    n_head INT,
+    T INT,
+    D INT)
+RETURNS attention_grads
+AS 'MODULE_PATHNAME', 'pg_llm_attention_backward'
 LANGUAGE C STRICT;
 
 -- AdamW optimizer step
