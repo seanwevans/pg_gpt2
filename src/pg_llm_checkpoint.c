@@ -1,4 +1,5 @@
 #include "pg_llm.h"
+#include "lib/stringinfo.h"
 #include <ctype.h>
 #include <errno.h>
 #include <limits.h>
@@ -23,6 +24,7 @@ static void free_npy_header(npy_header_t *hdr);
 static ssize_t read_npz_entry(gzFile fp, npy_header_t *hdr);
 static void gzread_exact(gzFile fp, void *dest, Size nbytes, const char *context);
 static void parse_npy_header(const char *header, npy_header_t *hdr);
+static void gzwrite_exact(gzFile fp, const void *src, Size nbytes, const char *context);
 
 PG_FUNCTION_INFO_V1(pg_llm_import_npz);
 
@@ -412,4 +414,100 @@ gzread_exact(gzFile fp, void *dest, Size nbytes, const char *context)
         }
         offset += nread;
     }
+}
+
+static void
+gzwrite_exact(gzFile fp, const void *src, Size nbytes, const char *context)
+{
+    Size offset = 0;
+    const unsigned char *ptr = (const unsigned char *) src;
+
+    while (offset < nbytes)
+    {
+        int nwrote = gzwrite(fp, ptr + offset, nbytes - offset);
+        if (nwrote <= 0)
+        {
+            int errnum;
+            const char *msg = gzerror(fp, &errnum);
+            ereport(ERROR,
+                    (errmsg("error writing %s: %s",
+                             context,
+                             msg ? msg : "unknown error")));
+        }
+        offset += nwrote;
+    }
+}
+
+void
+write_npz_entry(gzFile fp, const char *name, const float *array,
+                Size elem_size, Size elem_count)
+{
+    Size name_len;
+    unsigned char name_len_buf[2];
+    static const unsigned char magic[] = {0x93, 'N', 'U', 'M', 'P', 'Y'};
+    unsigned char version[2] = {1, 0};
+    StringInfoData header;
+    const char *dtype = "<f4";
+    Size header_base = sizeof(magic) + sizeof(version) + 2;
+    Size header_len;
+    Size payload_bytes;
+
+    if (name == NULL)
+        ereport(ERROR,
+                (errmsg("cannot export tensor with NULL name")));
+
+    name_len = strlen(name);
+    if (name_len == 0 || name_len > 0xFFFF)
+        ereport(ERROR,
+                (errmsg("invalid tensor name length for entry \"%s\"", name)));
+
+    if (elem_size != sizeof(float))
+        ereport(ERROR,
+                (errmsg("write_npz_entry currently supports float32 tensors only")));
+
+    if (elem_count > 0 && array == NULL)
+        ereport(ERROR,
+                (errmsg("tensor \"%s\" has NULL data pointer", name)));
+
+    if (elem_count > SIZE_MAX / elem_size)
+        ereport(ERROR,
+                (errmsg("tensor \"%s\" payload size overflows", name)));
+    payload_bytes = elem_size * elem_count;
+
+    name_len_buf[0] = (unsigned char) (name_len & 0xFF);
+    name_len_buf[1] = (unsigned char) ((name_len >> 8) & 0xFF);
+    gzwrite_exact(fp, name_len_buf, sizeof(name_len_buf), "tensor name length");
+    gzwrite_exact(fp, name, name_len, "tensor name");
+
+    gzwrite_exact(fp, magic, sizeof(magic), "numpy magic");
+    gzwrite_exact(fp, version, sizeof(version), "numpy version");
+
+    initStringInfo(&header);
+    appendStringInfo(&header,
+                     "{'descr': '%s', 'fortran_order': False, 'shape': (",
+                     dtype);
+    appendStringInfo(&header, "%zu", (size_t) elem_count);
+    appendStringInfoString(&header, ",), }");
+
+    while ((header_base + header.len + 1) % 16 != 0)
+        appendStringInfoChar(&header, ' ');
+    appendStringInfoChar(&header, '\n');
+
+    header_len = header.len;
+    if (header_len > 0xFFFF)
+        ereport(ERROR,
+                (errmsg("numpy header too large for tensor \"%s\"", name)));
+
+    unsigned char header_len_buf[2] = {
+        (unsigned char) (header_len & 0xFF),
+        (unsigned char) ((header_len >> 8) & 0xFF)
+    };
+    gzwrite_exact(fp, header_len_buf, sizeof(header_len_buf),
+                  "numpy header length");
+    gzwrite_exact(fp, header.data, header_len, "numpy header");
+
+    if (payload_bytes > 0)
+        gzwrite_exact(fp, array, payload_bytes, "tensor payload");
+
+    pfree(header.data);
 }
