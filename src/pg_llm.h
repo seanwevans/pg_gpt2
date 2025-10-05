@@ -20,6 +20,8 @@ extern Datum pg_llm_dropout(PG_FUNCTION_ARGS);
 extern Datum pg_llm_ones_like(PG_FUNCTION_ARGS);
 extern Datum pg_llm_zeros_like(PG_FUNCTION_ARGS);
 extern Datum pg_llm_transpose(PG_FUNCTION_ARGS);
+extern Datum pg_llm_attention(PG_FUNCTION_ARGS);
+extern Datum pg_llm_attention_backward(PG_FUNCTION_ARGS);
 extern Datum pg_llm_gelu_backward(PG_FUNCTION_ARGS);
 extern Datum pg_llm_softmax_backward(PG_FUNCTION_ARGS);
 extern Datum pg_llm_layernorm_backward(PG_FUNCTION_ARGS);
