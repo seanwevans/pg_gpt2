@@ -38,10 +38,19 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql STRICT;
 
-CREATE OR REPLACE FUNCTION llm_forward_gpt2(input BYTEA, n_layer INT, n_head INT, T INT, D INT)
+CREATE OR REPLACE FUNCTION llm_forward_gpt2(
+    input BYTEA,
+    n_layer INT,
+    n_head INT,
+    T INT,
+    D INT,
+    ln_f_weight BYTEA DEFAULT NULL,
+    ln_f_bias BYTEA DEFAULT NULL)
 RETURNS BYTEA AS $$
 DECLARE
     x BYTEA := input;
+    final_weight BYTEA := ln_f_weight;
+    final_bias BYTEA := ln_f_bias;
 BEGIN
     FOR i IN 0..(n_layer-1) LOOP
         x := llm_block_forward(
@@ -56,6 +65,40 @@ BEGIN
             (SELECT data FROM llm_tensor WHERE name = format('h.%s.ln_2.bias', i)),
             n_head, T, D);
     END LOOP;
-    RETURN x;
+    IF final_weight IS NULL THEN
+        SELECT data INTO final_weight
+        FROM llm_tensor
+        WHERE name = 'ln_f.weight'
+        LIMIT 1;
+    END IF;
+
+    IF final_weight IS NULL THEN
+        SELECT data INTO final_weight
+        FROM llm_param
+        WHERE name = 'ln_f.weight'
+          AND token_id = 0
+        LIMIT 1;
+    END IF;
+
+    IF final_bias IS NULL THEN
+        SELECT data INTO final_bias
+        FROM llm_tensor
+        WHERE name = 'ln_f.bias'
+        LIMIT 1;
+    END IF;
+
+    IF final_bias IS NULL THEN
+        SELECT data INTO final_bias
+        FROM llm_param
+        WHERE name = 'ln_f.bias'
+          AND token_id = 0
+        LIMIT 1;
+    END IF;
+
+    IF final_weight IS NULL OR final_bias IS NULL THEN
+        RAISE EXCEPTION 'Missing ln_f parameters for final layernorm';
+    END IF;
+
+    RETURN pg_llm_layernorm(x, final_weight, final_bias, 1e-5);
 END;
 $$ LANGUAGE plpgsql;
