@@ -187,6 +187,7 @@ BEGIN
     -- 2. Forward pass through transformer
     x := llm_forward_gpt2(
         x,
+        model,
         n_layer,
         n_head,
         array_length(tokens,1),
@@ -427,6 +428,16 @@ CREATE UNLOGGED TABLE llm_tensor_map (
     PRIMARY KEY (model, name, token_id)
 );
 
+CREATE FUNCTION pg_llm_autograd_map_param(
+    model TEXT,
+    name TEXT,
+    token_id INT,
+    tensor BYTEA,
+    dims INT[] DEFAULT NULL)
+RETURNS VOID
+AS 'MODULE_PATHNAME', 'pg_llm_autograd_map_param'
+LANGUAGE C;
+
 CREATE OR REPLACE FUNCTION llm_materialize_params(p_model TEXT)
 RETURNS VOID AS $$
 DECLARE
@@ -454,6 +465,17 @@ BEGIN
         ON CONFLICT (name) DO UPDATE
             SET data = EXCLUDED.data,
                 requires_grad = EXCLUDED.requires_grad;
+
+        IF rec.name LIKE 'h.%' || '.mlp.c_fc.bias'
+           OR rec.name LIKE 'h.%' || '.mlp.c_proj.bias' THEN
+            PERFORM pg_llm_autograd_map_param(
+                p_model,
+                rec.name,
+                rec.token_id,
+                rec.data,
+                ARRAY[octet_length(rec.data) / 4]
+            );
+        END IF;
 
         INSERT INTO llm_tensor_rt(data, grad, shape, requires_grad)
         VALUES (rec.data, NULL, NULL, true)
@@ -681,6 +703,7 @@ BEGIN
 
     x := llm_forward_gpt2(
         x,
+        model_name,
         n_layer,
         n_head,
         seq_len,
