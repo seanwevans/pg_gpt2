@@ -74,6 +74,16 @@ RETURNS BYTEA
 AS 'MODULE_PATHNAME', 'pg_llm_attention'
 LANGUAGE C STRICT;
 
+CREATE FUNCTION pg_llm_autograd_map_param(
+    model TEXT,
+    name TEXT,
+    token_id INT,
+    tensor BYTEA,
+    shape INT[] DEFAULT NULL)
+RETURNS VOID
+AS 'MODULE_PATHNAME', 'pg_llm_autograd_map_param'
+LANGUAGE C;
+
 -- AdamW optimizer step
 CREATE TYPE adamw_state AS (weight BYTEA, m BYTEA, v BYTEA);
 
@@ -405,7 +415,6 @@ RETURNS VOID AS $$
 DECLARE
     rec RECORD;
     tensor_name TEXT;
-    tensor_id INT;
 BEGIN
     -- Clear cached tensors for this step
     DELETE FROM llm_tensor;
@@ -428,14 +437,11 @@ BEGIN
             SET data = EXCLUDED.data,
                 requires_grad = EXCLUDED.requires_grad;
 
-        INSERT INTO llm_tensor_rt(data, grad, shape, requires_grad)
-        VALUES (rec.data, NULL, NULL, true)
-        RETURNING id INTO tensor_id;
-
-        INSERT INTO llm_tensor_map(model, name, token_id, tensor_id)
-        VALUES (p_model, rec.name, rec.token_id, tensor_id)
-        ON CONFLICT (model, name, token_id) DO UPDATE
-            SET tensor_id = EXCLUDED.tensor_id;
+        PERFORM pg_llm_autograd_map_param(
+            p_model,
+            rec.name,
+            rec.token_id,
+            rec.data);
     END LOOP;
 END;
 $$ LANGUAGE plpgsql;
