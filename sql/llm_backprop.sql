@@ -32,12 +32,20 @@ BEGIN
               SET grad = COALESCE(grad, pg_llm_zeros_like(data))
                         + pg_llm_matmul(pg_llm_transpose(a, m, k), grad, k,m,n)
               WHERE id=node.inputs[2];
-              ELSIF node.name='softmax' THEN
-    UPDATE llm_tensor_rt
-      SET grad = pg_llm_softmax_backward(
-          (SELECT data FROM llm_tensor_rt WHERE id=node.output),
-          (SELECT grad FROM llm_tensor_rt WHERE id=node.output))
-      WHERE id = node.inputs[1];
+        ELSIF node.name='softmax' THEN
+            UPDATE llm_tensor_rt
+              SET grad = pg_llm_softmax_backward(
+                  (SELECT data FROM llm_tensor_rt WHERE id=node.output),
+                  (SELECT grad FROM llm_tensor_rt WHERE id=node.output))
+              WHERE id = node.inputs[1];
+
+        ELSIF node.name='cross_entropy' THEN
+            UPDATE llm_tensor_rt
+              SET grad = COALESCE(grad, pg_llm_zeros_like(data))
+                        + pg_llm_cross_entropy_backward(
+                            (SELECT data FROM llm_tensor_rt WHERE id=node.inputs[1]),
+                            (node.extra->>'target')::INT)
+              WHERE id = node.inputs[1];
 
         ELSIF node.name='dropout' THEN
             UPDATE llm_tensor_rt

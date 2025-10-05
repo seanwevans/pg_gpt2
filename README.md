@@ -59,6 +59,7 @@ If PostgreSQL is installed somewhere custom, set the `PG_CONFIG` environment var
 | `llm_param` | Model parameters, gradients, optimizer state. |
 | `llm_dataset` | Tokenized training sequences. |
 | `llm_tape` / `llm_tensor_rt` | Computational graph and runtime tensors for autograd. |
+| `llm_autograd_mode` | Single-row toggle that signals when forward passes should record autograd tape entries. |
 | `llm_checkpoint` | Versioned checkpoint metadata and file paths. |
 | `llm_bpe_vocab` / `llm_bpe_merges` | GPT-2 tokenizer vocabulary and merge ranks. |
 | `llm_train_log` | Per-step learning rate and loss history. |
