@@ -212,6 +212,16 @@ pg_llm_autograd_record_tape(const char *name, int *inputs, int n_inputs, int out
     tape_insert(name, inputs, n_inputs, output, extra_json);
 }
 
+/*
+ * Register a parameter buffer with the autograd runtime so gradients can flow
+ * back to the owning (model, name, token_id) row.
+ *
+ * Call this immediately after materialising a parameter into a `bytea *` that
+ * will be passed to C kernels. This is especially important for buffers that
+ * are views over multiple parameters (e.g., the flattened tied embedding
+ * matrix) because autograd only sees runtime tensor ids. Without this mapping
+ * `llm_accumulate_grads` cannot copy grads back into `llm_param`.
+ */
 void
 pg_llm_autograd_map_param(const char *model,
                           const char *name,
