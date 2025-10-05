@@ -56,6 +56,7 @@ $$ LANGUAGE plpgsql STRICT;
 
 CREATE OR REPLACE FUNCTION llm_forward_gpt2(
     input BYTEA,
+    model TEXT,
     n_layer INT,
     n_head INT,
     T INT,
@@ -140,6 +141,22 @@ BEGIN
             RAISE EXCEPTION 'MLP proj bias for layer % has % bytes, expected % (broadcasted) or % (per token)',
                 i, octet_length(b_proj), expected_proj_bytes, per_token_proj_bytes;
         END IF;
+
+        PERFORM pg_llm_autograd_map_param(
+            model,
+            format('h.%s.mlp.c_fc.bias', i),
+            0,
+            b_fc_full,
+            ARRAY[octet_length(b_fc_full) / 4]
+        );
+
+        PERFORM pg_llm_autograd_map_param(
+            model,
+            format('h.%s.mlp.c_proj.bias', i),
+            0,
+            b_proj_full,
+            ARRAY[octet_length(b_proj_full) / 4]
+        );
 
         x := llm_block_forward(
             x,

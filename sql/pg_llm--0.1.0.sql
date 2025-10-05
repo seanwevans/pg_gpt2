@@ -51,6 +51,8 @@ LANGUAGE C STRICT;
 CREATE FUNCTION pg_llm_transpose(src BYTEA, rows INT, cols INT)
 RETURNS BYTEA
 AS 'MODULE_PATHNAME', 'pg_llm_transpose'
+LANGUAGE C STRICT;
+
 CREATE FUNCTION pg_llm_dropout_backward(
     input BYTEA,
     output BYTEA,
@@ -72,6 +74,37 @@ CREATE FUNCTION pg_llm_attention(
     D INT)
 RETURNS BYTEA
 AS 'MODULE_PATHNAME', 'pg_llm_attention'
+LANGUAGE C STRICT;
+
+CREATE FUNCTION pg_llm_autograd_map_param(
+    model TEXT,
+    name TEXT,
+    token_id INT,
+    tensor BYTEA,
+    shape INT[] DEFAULT NULL)
+RETURNS VOID
+AS 'MODULE_PATHNAME', 'pg_llm_autograd_map_param'
+LANGUAGE C;
+CREATE TYPE attention_grads AS (
+    dx BYTEA,
+    dw_qkv BYTEA,
+    db_qkv BYTEA,
+    dw_o BYTEA,
+    db_o BYTEA
+);
+
+CREATE FUNCTION pg_llm_attention_backward(
+    x BYTEA,
+    w_qkv BYTEA,
+    b_qkv BYTEA,
+    w_o BYTEA,
+    b_o BYTEA,
+    grad_output BYTEA,
+    n_head INT,
+    T INT,
+    D INT)
+RETURNS attention_grads
+AS 'MODULE_PATHNAME', 'pg_llm_attention_backward'
 LANGUAGE C STRICT;
 
 -- AdamW optimizer step
@@ -163,6 +196,7 @@ BEGIN
     -- 2. Forward pass through transformer
     x := llm_forward_gpt2(
         x,
+        model,
         n_layer,
         n_head,
         array_length(tokens,1),
@@ -172,7 +206,10 @@ BEGIN
         dropout_p => dropout_p,
         training => training);
 
-    -- 3. Final linear projection (tie weights with token_emb)
+    -- 3. Final linear projection (tie weights with token_emb).
+    --    When this concatenated matrix is handed to the matmul kernel the
+    --    runtime id must be registered via pg_llm_autograd_map_param so the
+    --    logits gradient is accumulated back into each `wte` row.
     logits := pg_llm_matmul(x,
         (SELECT string_agg(p.data::TEXT, '' ORDER BY p.token_id)::BYTEA
          FROM llm_param p
@@ -267,6 +304,10 @@ BEGIN
 
     INSERT INTO llm_train_log(model, step, lr, loss)
     VALUES(model, step_count, lr, loss);
+
+    -- Free runtime autograd state eagerly so the next step starts clean
+    DELETE FROM llm_tape;
+    DELETE FROM llm_tensor_rt;
 
     RETURN loss;
 END;
@@ -400,12 +441,21 @@ CREATE UNLOGGED TABLE llm_tensor_map (
     PRIMARY KEY (model, name, token_id)
 );
 
+CREATE FUNCTION pg_llm_autograd_map_param(
+    model TEXT,
+    name TEXT,
+    token_id INT,
+    tensor BYTEA,
+    dims INT[] DEFAULT NULL)
+RETURNS VOID
+AS 'MODULE_PATHNAME', 'pg_llm_autograd_map_param'
+LANGUAGE C;
+
 CREATE OR REPLACE FUNCTION llm_materialize_params(p_model TEXT)
 RETURNS VOID AS $$
 DECLARE
     rec RECORD;
     tensor_name TEXT;
-    tensor_id INT;
 BEGIN
     -- Clear cached tensors for this step
     DELETE FROM llm_tensor;
@@ -427,6 +477,17 @@ BEGIN
         ON CONFLICT (name) DO UPDATE
             SET data = EXCLUDED.data,
                 requires_grad = EXCLUDED.requires_grad;
+
+        IF rec.name LIKE 'h.%' || '.mlp.c_fc.bias'
+           OR rec.name LIKE 'h.%' || '.mlp.c_proj.bias' THEN
+            PERFORM pg_llm_autograd_map_param(
+                p_model,
+                rec.name,
+                rec.token_id,
+                rec.data,
+                ARRAY[octet_length(rec.data) / 4]
+            );
+        END IF;
 
         INSERT INTO llm_tensor_rt(data, grad, shape, requires_grad)
         VALUES (rec.data, NULL, NULL, true)
@@ -654,6 +715,7 @@ BEGIN
 
     x := llm_forward_gpt2(
         x,
+        model_name,
         n_layer,
         n_head,
         seq_len,

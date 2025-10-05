@@ -1,4 +1,5 @@
 #include "pg_llm.h"
+#include <string.h>
 
 #define PG_LLM_ATTENTION_CHUNK 64
 
@@ -16,8 +17,11 @@ attention_compute(float *x, float *w_qkv, float *b_qkv,
     float *Q_chunk;
     float *score_chunk;
     float *context_chunk;
+    float *K_head_T;
+    float *V_head;
     float *proj;
     const int chunk_rows = Min(PG_LLM_ATTENTION_CHUNK, (int)T);
+    const int pack_block = 32;
 
     qkv = (float *) palloc((Size)T * 3 * D * sizeof(float));
     pg_llm_fast_gemm(x, w_qkv, qkv, T, D, 3 * D);
@@ -33,19 +37,33 @@ attention_compute(float *x, float *w_qkv, float *b_qkv,
     Q_chunk = (float *) palloc((Size)chunk_rows * head_dim * sizeof(float));
     score_chunk = (float *) palloc((Size)chunk_rows * T * sizeof(float));
     context_chunk = (float *) palloc((Size)chunk_rows * head_dim * sizeof(float));
+    K_head_T = (float *) palloc((Size)head_dim * T * sizeof(float));
+    V_head = (float *) palloc((Size)T * head_dim * sizeof(float));
 
     for (int h = 0; h < n_head; ++h) {
         int off = h * head_dim;
-        float *K_head_T = (float *) palloc((Size)head_dim * T * sizeof(float));
-        float *V_head = (float *) palloc((Size)T * head_dim * sizeof(float));
+        const float *K_head = K + off;
+        const float *V_head_src = V + off;
 
-        for (int t = 0; t < T; ++t) {
-            const float *k_src = K + (Size)t * D + off;
-            const float *v_src = V + (Size)t * D + off;
-            float *v_dst = V_head + (Size)t * head_dim;
-            memcpy(v_dst, v_src, head_dim * sizeof(float));
-            for (int d = 0; d < head_dim; ++d)
-                K_head_T[(Size)d * T + t] = k_src[d];
+        for (int t0 = 0; t0 < T; t0 += pack_block) {
+            int t_block = Min(pack_block, (int)T - t0);
+
+            for (int tt = 0; tt < t_block; ++tt) {
+                const float *v_src = V_head_src + (Size)(t0 + tt) * D;
+                float *v_dst = V_head + (Size)(t0 + tt) * head_dim;
+                memcpy(v_dst, v_src, head_dim * sizeof(float));
+            }
+
+            for (int d0 = 0; d0 < head_dim; d0 += pack_block) {
+                int d_block = Min(pack_block, head_dim - d0);
+                for (int dd = 0; dd < d_block; ++dd) {
+                    int d = d0 + dd;
+                    float *k_dst = K_head_T + (Size)d * T + t0;
+                    const float *k_src = K_head + (Size)t0 * D + d;
+                    for (int tt = 0; tt < t_block; ++tt)
+                        k_dst[tt] = k_src[(Size)tt * D];
+                }
+            }
         }
 
         for (int base = 0; base < T; base += chunk_rows) {
@@ -95,8 +113,6 @@ attention_compute(float *x, float *w_qkv, float *b_qkv,
             }
         }
 
-        pfree(K_head_T);
-        pfree(V_head);
     }
 
     proj = (float *) palloc((Size)T * D * sizeof(float));
@@ -109,6 +125,8 @@ attention_compute(float *x, float *w_qkv, float *b_qkv,
     memcpy(Y, proj, (Size)T * D * sizeof(float));
 
     pfree(proj);
+    pfree(V_head);
+    pfree(K_head_T);
     pfree(context_chunk);
     pfree(score_chunk);
     pfree(Q_chunk);
@@ -127,6 +145,7 @@ attention_compute(float *x, float *w_qkv, float *b_qkv,
  * returns: BYTEA (T×D)
  */
 PG_FUNCTION_INFO_V1(pg_llm_attention);
+PG_FUNCTION_INFO_V1(pg_llm_attention_backward);
 Datum pg_llm_attention(PG_FUNCTION_ARGS)
 {
     bytea *x_b    = PG_GETARG_BYTEA_P(0);
