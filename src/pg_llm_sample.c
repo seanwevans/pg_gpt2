@@ -30,38 +30,46 @@ Datum pg_llm_sample(PG_FUNCTION_ARGS)
 
     int n = (int)(nbytes(z_b)/sizeof(float));
     float *z = as_float(z_b);
+    float *p;
+    float maxv;
+    float sum = 0;
+    float r;
+    float c = 0;
+    int chosen = n - 1;
 
     if (temp <= 0) temp = 1.0f;
-    float *p = palloc(n*sizeof(float));
+    p = palloc(n*sizeof(float));
 
     /* 1. softmax with temperature */
-    float maxv = z[0]/temp;
+    maxv = z[0]/temp;
     for (int i=1;i<n;++i) if (z[i]/temp > maxv) maxv = z[i]/temp;
-    float sum=0;
     for (int i=0;i<n;++i){ p[i]=expf((z[i]/temp)-maxv); sum+=p[i]; }
     for (int i=0;i<n;++i) p[i]/=sum;
 
     /* 2. top-k pruning */
     if (topk>0 && topk<n) {
         float *copy = palloc(n*sizeof(float));
+        float thresh;
+        float s = 0;
         memcpy(copy,p,n*sizeof(float));
         qsort(copy,n,sizeof(float),compare_desc_float);
-        float thresh = copy[topk-1];
+        thresh = copy[topk-1];
         for(int i=0;i<n;++i) if(p[i]<thresh) p[i]=0;
         pfree(copy);
-        float s=0; for(int i=0;i<n;++i) s+=p[i];
+        for(int i=0;i<n;++i) s+=p[i];
         if(s>0) for(int i=0;i<n;++i) p[i]/=s;
     }
 
     /* 3. top-p pruning */
     if (topp>0 && topp<1.0f) {
         int *idx = palloc(n*sizeof(int));
+        float cum = 0;
+        float s = 0;
         for(int i=0;i<n;++i) idx[i]=i;
         /* sort indices by prob desc */
         for(int i=0;i<n-1;++i)
             for(int j=i+1;j<n;++j)
                 if(p[idx[j]]>p[idx[i]]){int t=idx[i];idx[i]=idx[j];idx[j]=t;}
-        float cum=0;
         for(int k=0;k<n;++k){
             cum+=p[idx[k]];
             if(cum>topp){
@@ -69,15 +77,13 @@ Datum pg_llm_sample(PG_FUNCTION_ARGS)
                 break;
             }
         }
-        float s=0;for(int i=0;i<n;++i)s+=p[i];
+        for(int i=0;i<n;++i)s+=p[i];
         if(s>0)for(int i=0;i<n;++i)p[i]/=s;
         pfree(idx);
     }
 
     /* 4. sample */
-    float r = (float)rand()/(float)RAND_MAX;
-    float c=0;
-    int chosen=n-1;
+    r = (float)rand()/(float)RAND_MAX;
     for(int i=0;i<n;++i){ c+=p[i]; if(r<=c){chosen=i;break;} }
 
     PG_RETURN_INT32(chosen);

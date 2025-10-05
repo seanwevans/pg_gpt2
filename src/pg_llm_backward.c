@@ -5,15 +5,20 @@ Datum pg_llm_gelu_backward(PG_FUNCTION_ARGS)
 {
     bytea *x_b = PG_GETARG_BYTEA_P(0);
     bytea *dy_b= PG_GETARG_BYTEA_P(1);
-    int n = (int)(nbytes(x_b)/sizeof(float));
-    bytea *out = (bytea*) palloc(n*sizeof(float)+VARHDRSZ);
+    int n;
+    bytea *out;
+    float *x;
+    float *dy;
+    float *dx;
+    const float k = 0.79788456f;
+
+    n = (int)(nbytes(x_b)/sizeof(float));
+    out = (bytea*) palloc(n*sizeof(float)+VARHDRSZ);
     SET_VARSIZE(out,n*sizeof(float)+VARHDRSZ);
 
-    float *x = as_float(x_b);
-    float *dy= as_float(dy_b);
-    float *dx= as_float(out);
-
-    const float k = 0.79788456f;
+    x = as_float(x_b);
+    dy= as_float(dy_b);
+    dx= as_float(out);
     for(int i=0;i<n;++i){
         float x3=x[i]*x[i]*x[i];
         float tanh_arg = k*(x[i]+0.044715f*x3);
@@ -34,15 +39,18 @@ Datum pg_llm_softmax_backward(PG_FUNCTION_ARGS)
     bytea *y_b  = PG_GETARG_BYTEA_P(0);  /* output of softmax */
     bytea *dy_b = PG_GETARG_BYTEA_P(1);  /* upstream gradient */
     int n = (int)(nbytes(y_b)/sizeof(float));
+    bytea *out;
+    float *y;
+    float *dy;
+    float *dx;
+    float dot = 0.f;
 
-    bytea *out = (bytea*) palloc(n*sizeof(float)+VARHDRSZ);
+    out = (bytea*) palloc(n*sizeof(float)+VARHDRSZ);
     SET_VARSIZE(out, n*sizeof(float)+VARHDRSZ);
 
-    float *y  = as_float(y_b);
-    float *dy = as_float(dy_b);
-    float *dx = as_float(out);
-
-    float dot = 0.f;
+    y  = as_float(y_b);
+    dy = as_float(dy_b);
+    dx = as_float(out);
     for (int i=0;i<n;++i)
         dot += y[i]*dy[i];
 
@@ -64,32 +72,50 @@ Datum pg_llm_layernorm_backward(PG_FUNCTION_ARGS)
     float eps = PG_GETARG_FLOAT4(3);
 
     int n = (int)(nbytes(x_b)/sizeof(float));
-    float *x  = as_float(x_b);
-    float *dy = as_float(dy_b);
-    float *g  = as_float(gamma_b);
+    float *x;
+    float *dy;
+    float *g;
+    bytea *dx_b;
+    float *dx;
+    bytea *dg_b;
+    float *dg;
+    bytea *db_b;
+    float *db;
+    float mean = 0;
+    float var = 0;
+    float inv_std;
+    float xhat[4096]; /* assume <=4k dims per token */
+    float sum_dy = 0;
+    float sum_dy_xhat = 0;
+    TupleDesc tupdesc;
+    Datum values[3];
+    bool nulls[3] = {false,false,false};
+    HeapTuple rettuple;
 
-    bytea *dx_b = (bytea*) palloc(n*sizeof(float)+VARHDRSZ);
+    x  = as_float(x_b);
+    dy = as_float(dy_b);
+    g  = as_float(gamma_b);
+
+    dx_b = (bytea*) palloc(n*sizeof(float)+VARHDRSZ);
     SET_VARSIZE(dx_b,n*sizeof(float)+VARHDRSZ);
-    float *dx = as_float(dx_b);
+    dx = as_float(dx_b);
 
-    bytea *dg_b = (bytea*) palloc(n*sizeof(float)+VARHDRSZ);
+    dg_b = (bytea*) palloc(n*sizeof(float)+VARHDRSZ);
     SET_VARSIZE(dg_b,n*sizeof(float)+VARHDRSZ);
-    float *dg = as_float(dg_b);
+    dg = as_float(dg_b);
 
-    bytea *db_b = (bytea*) palloc(n*sizeof(float)+VARHDRSZ);
+    db_b = (bytea*) palloc(n*sizeof(float)+VARHDRSZ);
     SET_VARSIZE(db_b,n*sizeof(float)+VARHDRSZ);
-    float *db = as_float(db_b);
+    db = as_float(db_b);
 
     /* compute mean/var */
-    float mean=0, var=0;
     for(int i=0;i<n;++i) mean+=x[i];
     mean/=n;
     for(int i=0;i<n;++i){ float d=x[i]-mean; var+=d*d; }
     var/=n;
-    float inv_std = 1.0f/sqrtf(var+eps);
+    inv_std = 1.0f/sqrtf(var+eps);
 
     /* normalized */
-    float xhat[4096]; /* assume <=4k dims per token */
     for(int i=0;i<n;++i) xhat[i]=(x[i]-mean)*inv_std;
 
     /* dBeta, dGamma */
@@ -99,7 +125,6 @@ Datum pg_llm_layernorm_backward(PG_FUNCTION_ARGS)
     }
 
     /* sums for dX */
-    float sum_dy=0, sum_dy_xhat=0;
     for(int i=0;i<n;++i){
         sum_dy += dy[i]*g[i];
         sum_dy_xhat += dy[i]*g[i]*xhat[i];
@@ -112,15 +137,12 @@ Datum pg_llm_layernorm_backward(PG_FUNCTION_ARGS)
         dx[i] = inv_std*(t1 - t2 - t3);
     }
 
-    TupleDesc tupdesc;
-    Datum values[3];
-    bool nulls[3] = {false,false,false};
     if (get_call_result_type(fcinfo,NULL,&tupdesc)!=TYPEFUNC_COMPOSITE)
         ereport(ERROR,(errmsg("expected composite return")));
     BlessTupleDesc(tupdesc);
     values[0]=PointerGetDatum(dx_b);
     values[1]=PointerGetDatum(dg_b);
     values[2]=PointerGetDatum(db_b);
-    HeapTuple rettuple = heap_form_tuple(tupdesc,values,nulls);
+    rettuple = heap_form_tuple(tupdesc,values,nulls);
     PG_RETURN_DATUM(HeapTupleGetDatum(rettuple));
 }

@@ -36,10 +36,11 @@ Datum pg_llm_import_npz(PG_FUNCTION_ARGS)
     text *model_t = PG_GETARG_TEXT_P(1);
     char *path = text_to_cstring(path_t);
     char *model = text_to_cstring(model_t);
+    gzFile fp;
 
     SPI_connect();
 
-    gzFile fp = gzopen(path, "rb");
+    fp = gzopen(path, "rb");
     if (!fp)
     {
         SPI_finish();
@@ -53,6 +54,10 @@ Datum pg_llm_import_npz(PG_FUNCTION_ARGS)
         {
             npy_header_t hdr;
             ssize_t payload_bytes;
+            bytea *data;
+            StringInfoData q;
+            Oid argtypes[1];
+            Datum values[1];
 
             MemSet(&hdr, 0, sizeof(npy_header_t));
 
@@ -83,20 +88,19 @@ Datum pg_llm_import_npz(PG_FUNCTION_ARGS)
                 ereport(ERROR,
                         (errmsg("tensor \"%s\" too large to fit in memory", hdr.key)));
 
-            bytea *data = (bytea *) palloc(VARHDRSZ + hdr.payload_bytes);
+            data = (bytea *) palloc(VARHDRSZ + hdr.payload_bytes);
             SET_VARSIZE(data, VARHDRSZ + hdr.payload_bytes);
             gzread_exact(fp, VARDATA(data), hdr.payload_bytes,
                          hdr.key ? hdr.key : "tensor payload");
 
-            StringInfoData q;
             initStringInfo(&q);
             appendStringInfo(&q,
                              "INSERT INTO llm_param(model,name,data,grad,m,v,step)"
                              "VALUES('%s','%s',$1,'','', '',0)"
                              "ON CONFLICT (model,name) DO UPDATE SET data=$1;",
                              model, hdr.key);
-            Oid argtypes[1] = {BYTEAOID};
-            Datum values[1] = {PointerGetDatum(data)};
+            argtypes[0] = BYTEAOID;
+            values[0] = PointerGetDatum(data);
             SPI_execute_with_args(q.data, 1, argtypes, values, NULL, false, 0);
 
             pfree(data);
@@ -170,6 +174,7 @@ parse_shape(const char *shape_str, npy_header_t *hdr)
     int     ndims = 0;
     int     capacity = 0;
     const char *p = shape_str;
+    long dim = 0;
 
     while (isspace((unsigned char) *p))
         p++;
@@ -195,7 +200,7 @@ parse_shape(const char *shape_str, npy_header_t *hdr)
                     (errmsg("invalid numpy header: expected dimension length")));
 
         errno = 0;
-        long dim = strtol(p, (char **) &p, 10);
+        dim = strtol(p, (char **) &p, 10);
         if (errno != 0 || dim < 0)
             ereport(ERROR,
                     (errmsg("invalid numpy header: bad dimension length")));
@@ -247,6 +252,9 @@ parse_npy_header(const char *header, npy_header_t *hdr)
     const char *descr_key = strstr(header, "'descr':");
     const char *fortran_key = strstr(header, "'fortran_order':");
     const char *shape_key = strstr(header, "'shape':");
+    const char *descr_end;
+    char quote;
+    Size total_elems;
 
     if (!descr_key || !fortran_key || !shape_key)
         ereport(ERROR,
@@ -258,8 +266,8 @@ parse_npy_header(const char *header, npy_header_t *hdr)
     if (*descr_key != '\'' && *descr_key != '"')
         ereport(ERROR,
                 (errmsg("invalid numpy header: malformed descr")));
-    char quote = *descr_key++;
-    const char *descr_end = strchr(descr_key, quote);
+    quote = *descr_key++;
+    descr_end = strchr(descr_key, quote);
     if (!descr_end)
         ereport(ERROR,
                 (errmsg("invalid numpy header: unterminated descr")));
@@ -286,7 +294,7 @@ parse_npy_header(const char *header, npy_header_t *hdr)
     parse_shape(shape_key, hdr);
 
     /* compute payload size */
-    Size total_elems = 1;
+    total_elems = 1;
     if (hdr->ndim == 0)
     {
         total_elems = 1;
@@ -324,6 +332,7 @@ read_npz_entry(gzFile fp, npy_header_t *hdr)
     unsigned char magic[6];
     unsigned char version[2];
     Size     header_len;
+    Size     name_len;
 
     nread = gzread(fp, name_len_buf, sizeof(name_len_buf));
     if (nread == 0)
@@ -332,7 +341,7 @@ read_npz_entry(gzFile fp, npy_header_t *hdr)
         ereport(ERROR,
                 (errmsg("failed to read npz entry name length")));
 
-    Size name_len = (Size) name_len_buf[0] | ((Size) name_len_buf[1] << 8);
+    name_len = (Size) name_len_buf[0] | ((Size) name_len_buf[1] << 8);
     if (name_len == 0)
         ereport(ERROR,
                 (errmsg("npz entry with empty name")));
