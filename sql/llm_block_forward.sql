@@ -58,7 +58,9 @@ RETURNS BYTEA AS $$
 DECLARE
     x BYTEA := input;
     w_qkv BYTEA;
+    b_qkv BYTEA;
     w_o BYTEA;
+    b_o BYTEA;
     w_fc BYTEA;
     b_fc BYTEA;
     w_proj BYTEA;
@@ -78,7 +80,21 @@ DECLARE
 BEGIN
     FOR i IN 0..(n_layer-1) LOOP
         SELECT data INTO w_qkv FROM llm_tensor WHERE name = format('h.%s.attn.c_attn.weight', i);
+        SELECT data INTO b_qkv FROM llm_tensor WHERE name = format('h.%s.attn.c_attn.bias', i);
+        IF b_qkv IS NULL THEN
+            SELECT data INTO b_qkv FROM llm_param WHERE name = format('h.%s.attn.c_attn.bias', i) AND token_id = 0 LIMIT 1;
+        END IF;
+        IF b_qkv IS NULL THEN
+            RAISE EXCEPTION 'Missing attention qkv bias for layer %', i;
+        END IF;
         SELECT data INTO w_o FROM llm_tensor WHERE name = format('h.%s.attn.c_proj.weight', i);
+        SELECT data INTO b_o FROM llm_tensor WHERE name = format('h.%s.attn.c_proj.bias', i);
+        IF b_o IS NULL THEN
+            SELECT data INTO b_o FROM llm_param WHERE name = format('h.%s.attn.c_proj.bias', i) AND token_id = 0 LIMIT 1;
+        END IF;
+        IF b_o IS NULL THEN
+            RAISE EXCEPTION 'Missing attention proj bias for layer %', i;
+        END IF;
         SELECT data INTO w_fc FROM llm_tensor WHERE name = format('h.%s.mlp.c_fc.weight', i);
         SELECT data INTO b_fc FROM llm_tensor WHERE name = format('h.%s.mlp.c_fc.bias', i);
         SELECT data INTO w_proj FROM llm_tensor WHERE name = format('h.%s.mlp.c_proj.weight', i);
@@ -118,7 +134,9 @@ BEGIN
         x := llm_block_forward(
             x,
             w_qkv,
+            b_qkv,
             w_o,
+            b_o,
             w_fc,
             b_fc_full,
             w_proj,
