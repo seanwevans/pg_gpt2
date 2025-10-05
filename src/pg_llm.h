@@ -16,6 +16,7 @@ extern Datum pg_llm_gelu(PG_FUNCTION_ARGS);
 extern Datum pg_llm_softmax(PG_FUNCTION_ARGS);
 extern Datum pg_llm_layernorm(PG_FUNCTION_ARGS);
 extern Datum pg_llm_cross_entropy(PG_FUNCTION_ARGS);
+extern Datum pg_llm_dropout(PG_FUNCTION_ARGS);
 
 /* Utility helpers */
 static inline float* as_float(bytea *b) {

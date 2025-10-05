@@ -1,0 +1,28 @@
+DROP FUNCTION
+CREATE FUNCTION
+SET
+             label             |                            input_hex                             |                            output_hex                            | exact_match 
+-------------------------------+------------------------------------------------------------------+------------------------------------------------------------------+-------------
+ dropout inference passthrough | 0000803f0000803f0000803f0000803f0000803f0000803f0000803f0000803f | 0000803f0000803f0000803f0000803f0000803f0000803f0000803f0000803f | t
+(1 row)
+
+ setseed 
+---------
+ 
+(1 row)
+
+          label          |                            output_hex                            
+-------------------------+------------------------------------------------------------------
+ dropout training sample | e4388e3fe4388e3fe4388e3fe4388e3fe4388e3fe4388e3fe4388e3fe4388e3f
+(1 row)
+
+ setseed 
+---------
+ 
+(1 row)
+
+         label          | mean_val | approx_expected | zero_count | total_count | scaled_matches 
+------------------------+----------+-----------------+------------+-------------+----------------
+ dropout training stats | 1.002604 | t               |         25 |         256 | t
+(1 row)
+

@@ -9,7 +9,8 @@ sql/pg_llm--0.1.0.sql \
 sql/llm_block_forward.sql \
 sql/llm_backprop.sql
 
-REGRESS = adamw
+REGRESS = adamw dropout
+REGRESS_OPTS = --dlpath=$(abs_builddir)
 
 PG_CPPFLAGS += -I$(srcdir)/src
 
