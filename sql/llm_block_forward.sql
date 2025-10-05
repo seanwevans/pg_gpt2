@@ -19,6 +19,7 @@ DECLARE
     x BYTEA := input;
     attn BYTEA;
     mlp BYTEA;
+    residual2 BYTEA;
 BEGIN
     -- 1. LayerNorm
     x := pg_llm_layernorm(x, ln1_g, ln1_b, eps);
@@ -28,6 +29,7 @@ BEGIN
     x := pg_llm_add(input, attn);  -- residual 1
 
     -- 3. LayerNorm
+    residual2 := x;
     x := pg_llm_layernorm(x, ln2_g, ln2_b, eps);
 
     -- 4. Feed-Forward MLP
@@ -35,7 +37,7 @@ BEGIN
     mlp := pg_llm_gelu(mlp);
     mlp := pg_llm_matmul(mlp, w_proj, T, 4*D, D);
 
-    x := pg_llm_add(x, mlp);       -- residual 2
+    x := pg_llm_add(residual2, mlp);       -- residual 2
     RETURN x;
 END;
 $$ LANGUAGE plpgsql STRICT;
