@@ -3,13 +3,22 @@ RETURNS VOID AS $$
 DECLARE
     node RECORD;
     grad BYTEA;
-    a_id INT; b_id INT;
-    a BYTEA; b BYTEA;
     m INT; k INT; n INT;
+    ln_dx BYTEA;
+    ln_dgamma BYTEA;
+    ln_dbeta BYTEA;
+    attn_dx BYTEA;
+    attn_dw_qkv BYTEA;
+    attn_db_qkv BYTEA;
+    attn_dw_o BYTEA;
+    attn_db_o BYTEA;
+    dx BYTEA; dgamma BYTEA; dbeta BYTEA;
 BEGIN
     -- seed gradient of final output = 1
     UPDATE llm_tensor_rt SET grad = pg_llm_ones_like(data) WHERE id=start_id;
 
+    -- Replay the tape in reverse order.  Each op name recorded during the
+    -- forward pass determines which gradient kernel we invoke.
     FOR node IN SELECT * FROM llm_tape ORDER BY id DESC LOOP
         IF node.name='add' THEN
             UPDATE llm_tensor_rt
@@ -59,19 +68,78 @@ BEGIN
               WHERE id=node.inputs[1];
 
         ELSIF node.name='layernorm' THEN
-            PERFORM (SELECT dx, dgamma, dbeta
-             FROM pg_llm_layernorm_backward(
-                 (SELECT data FROM llm_tensor_rt WHERE id=node.inputs[1]),
-                 (SELECT grad FROM llm_tensor_rt WHERE id=node.output),
-                 (SELECT data FROM llm_tensor_rt WHERE id=node.extra->>'gamma_id'),
-                 (node.extra->>'eps')::FLOAT4));
-    -- accumulate dx→input.grad, dγ→γ.grad, dβ→β.grad
+            SELECT dx, dgamma, dbeta
+              INTO ln_dx, ln_dgamma, ln_dbeta
+            FROM pg_llm_layernorm_backward(
+                (SELECT data FROM llm_tensor_rt WHERE id=node.inputs[1]),
+                (SELECT grad FROM llm_tensor_rt WHERE id=node.output),
+                (SELECT data FROM llm_tensor_rt WHERE id=node.inputs[2]),
+                (node.extra->>'eps')::FLOAT4);
+
+            UPDATE llm_tensor_rt
+              SET grad = COALESCE(grad, pg_llm_zeros_like(data)) + ln_dx
+              WHERE id = node.inputs[1];
+
+            UPDATE llm_tensor_rt
+              SET grad = COALESCE(grad, pg_llm_zeros_like(data)) + ln_dgamma
+              WHERE id = node.inputs[2];
+
+            UPDATE llm_tensor_rt
+              SET grad = COALESCE(grad, pg_llm_zeros_like(data)) + ln_dbeta
+              WHERE id = node.inputs[3];
         ELSIF node.name='gelu' THEN
             UPDATE llm_tensor_rt
               SET grad = COALESCE(grad, pg_llm_zeros_like(data))
                         + pg_llm_gelu_backward((SELECT data FROM llm_tensor_rt WHERE id=node.inputs[1]),
                                                (SELECT grad FROM llm_tensor_rt WHERE id=node.output))
               WHERE id=node.inputs[1];
+        ELSIF node.name='ones_like' THEN
+            -- constant tensor; no gradient to propagate
+            CONTINUE;
+        ELSIF node.name='zeros_like' THEN
+            -- constant tensor; no gradient to propagate
+            CONTINUE;
+        ELSIF node.name='transpose' THEN
+            UPDATE llm_tensor_rt
+              SET grad = COALESCE(grad, pg_llm_zeros_like(data))
+                        + pg_llm_transpose(
+                            (SELECT grad FROM llm_tensor_rt WHERE id=node.output),
+                            (node.extra->>'cols')::INT,
+                            (node.extra->>'rows')::INT)
+              WHERE id = node.inputs[1];
+        ELSIF node.name='attention' THEN
+            SELECT dx, dw_qkv, db_qkv, dw_o, db_o
+              INTO attn_dx, attn_dw_qkv, attn_db_qkv, attn_dw_o, attn_db_o
+            FROM pg_llm_attention_backward(
+                (SELECT data FROM llm_tensor_rt WHERE id=node.inputs[1]),
+                (SELECT data FROM llm_tensor_rt WHERE id=node.inputs[2]),
+                (SELECT data FROM llm_tensor_rt WHERE id=node.inputs[3]),
+                (SELECT data FROM llm_tensor_rt WHERE id=node.inputs[4]),
+                (SELECT data FROM llm_tensor_rt WHERE id=node.inputs[5]),
+                (SELECT grad FROM llm_tensor_rt WHERE id=node.output),
+                (node.extra->>'n_head')::INT,
+                (node.extra->>'T')::INT,
+                (node.extra->>'D')::INT);
+
+            UPDATE llm_tensor_rt
+              SET grad = COALESCE(grad, pg_llm_zeros_like(data)) + attn_dx
+              WHERE id = node.inputs[1];
+
+            UPDATE llm_tensor_rt
+              SET grad = COALESCE(grad, pg_llm_zeros_like(data)) + attn_dw_qkv
+              WHERE id = node.inputs[2];
+
+            UPDATE llm_tensor_rt
+              SET grad = COALESCE(grad, pg_llm_zeros_like(data)) + attn_db_qkv
+              WHERE id = node.inputs[3];
+
+            UPDATE llm_tensor_rt
+              SET grad = COALESCE(grad, pg_llm_zeros_like(data)) + attn_dw_o
+              WHERE id = node.inputs[4];
+
+            UPDATE llm_tensor_rt
+              SET grad = COALESCE(grad, pg_llm_zeros_like(data)) + attn_db_o
+              WHERE id = node.inputs[5];
         -- Similar for layernorm, softmax, cross_entropy etc.
         END IF;
     END LOOP;

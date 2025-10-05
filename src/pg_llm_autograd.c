@@ -215,12 +215,12 @@ pg_llm_autograd_record_tape(const char *name, int *inputs, int n_inputs, int out
 }
 
 static void
-pg_llm_autograd_map_param_impl(const char *model,
-                               const char *name,
-                               int token_id,
-                               bytea *tensor,
-                               int ndims,
-                               const int *dims)
+pg_llm_autograd_map_param_internal(const char *model,
+                                   const char *name,
+                                   int token_id,
+                                   bytea *tensor,
+                                   int ndims,
+                                   const int *dims)
 {
     Datum       values[4];
     bool        nulls[4] = {false, false, false, false};
@@ -231,25 +231,113 @@ pg_llm_autograd_map_param_impl(const char *model,
     if (model == NULL || name == NULL)
         ereport(ERROR, (errmsg("model and name must be provided for param mapping")));
 
-    tensor_id = pg_llm_autograd_track_tensor(tensor, ndims, dims, true);
+    if (SPI_connect() != SPI_OK_CONNECT)
+        ereport(ERROR, (errmsg("SPI_connect failed in pg_llm_autograd_map_param_internal")));
 
-    values[0] = CStringGetTextDatum(model);
-    values[1] = CStringGetTextDatum(name);
-    values[2] = Int32GetDatum(token_id);
-    values[3] = Int32GetDatum(tensor_id);
+    PG_TRY();
+    {
+        tensor_id = pg_llm_autograd_track_tensor(tensor, ndims, dims, true);
 
-    ret = SPI_execute_with_args(
-        "INSERT INTO llm_tensor_map(model,name,token_id,tensor_id) "
-        "VALUES($1,$2,$3,$4) "
-        "ON CONFLICT (model,name,token_id) DO UPDATE SET tensor_id=EXCLUDED.tensor_id",
-        4,
-        argtypes,
-        values,
-        nulls,
-        false,
-        0);
-    if (ret != SPI_OK_INSERT && ret != SPI_OK_UPDATE)
-        ereport(ERROR, (errmsg("failed to upsert tensor map")));
+        values[0] = CStringGetTextDatum(model);
+        values[1] = CStringGetTextDatum(name);
+        values[2] = Int32GetDatum(token_id);
+        values[3] = Int32GetDatum(tensor_id);
+
+        ret = SPI_execute_with_args(
+            "INSERT INTO llm_tensor_map(model,name,token_id,tensor_id) "
+            "VALUES($1,$2,$3,$4) "
+            "ON CONFLICT (model,name,token_id) DO UPDATE SET tensor_id=EXCLUDED.tensor_id",
+            4,
+            argtypes,
+            values,
+            nulls,
+            false,
+            0);
+        if (ret != SPI_OK_INSERT && ret != SPI_OK_UPDATE)
+            ereport(ERROR, (errmsg("failed to upsert tensor map")));
+    }
+    PG_CATCH();
+    {
+        SPI_finish();
+        PG_RE_THROW();
+    }
+    PG_END_TRY();
+
+    SPI_finish();
+}
+
+PG_FUNCTION_INFO_V1(pg_llm_autograd_map_param);
+
+Datum
+pg_llm_autograd_map_param(PG_FUNCTION_ARGS)
+{
+    text       *model_text = PG_GETARG_TEXT_PP(0);
+    text       *name_text = PG_GETARG_TEXT_PP(1);
+    int32       token_id = PG_GETARG_INT32(2);
+    bytea      *tensor = PG_GETARG_BYTEA_P(3);
+    ArrayType  *shape = PG_ARGISNULL(4) ? NULL : PG_GETARG_ARRAYTYPE_P(4);
+    int         ndims = 0;
+    int        *dims = NULL;
+    int         dims_local[8];
+
+    if (shape != NULL)
+    {
+        if (ARR_ELEMTYPE(shape) != INT4OID)
+            ereport(ERROR,
+                    (errmsg("pg_llm_autograd_map_param expects an INT4[] for dims")));
+
+        if (ARR_NDIM(shape) > 0)
+        {
+            Datum  *elem_values;
+            bool   *elem_nulls;
+            int     nelems;
+
+            deconstruct_array(shape,
+                              INT4OID,
+                              sizeof(int32),
+                              true,
+                              'i',
+                              &elem_values,
+                              &elem_nulls,
+                              &nelems);
+
+            if (nelems > (int) lengthof(dims_local))
+                dims = (int *) palloc(nelems * sizeof(int));
+            else
+                dims = dims_local;
+
+            for (int i = 0; i < nelems; i++)
+            {
+                if (elem_nulls[i])
+                    ereport(ERROR,
+                            (errmsg("pg_llm_autograd_map_param received NULL dimension")));
+                dims[i] = DatumGetInt32(elem_values[i]);
+            }
+
+            ndims = nelems;
+            pfree(elem_values);
+            pfree(elem_nulls);
+        }
+    }
+
+    if (ndims == 0)
+    {
+        ndims = 1;
+        dims = dims_local;
+        dims[0] = float_length(tensor, "pg_llm_autograd_map_param");
+    }
+
+    pg_llm_autograd_map_param_internal(text_to_cstring(model_text),
+                                       text_to_cstring(name_text),
+                                       token_id,
+                                       tensor,
+                                       ndims,
+                                       dims);
+
+    if (dims != dims_local)
+        pfree(dims);
+
+    PG_RETURN_VOID();
 }
 
 Datum

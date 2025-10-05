@@ -20,6 +20,16 @@ RETURNS BYTEA
 AS '/workspace/pg_gpt2/pg_llm', 'pg_llm_softmax_backward'
 LANGUAGE C STRICT;
 
+CREATE OR REPLACE FUNCTION pg_llm_dropout_backward(
+    input BYTEA,
+    output BYTEA,
+    grad BYTEA,
+    p REAL,
+    training BOOLEAN)
+RETURNS BYTEA
+AS '/workspace/pg_gpt2/pg_llm', 'pg_llm_dropout_backward'
+LANGUAGE C STRICT;
+
 CREATE OR REPLACE FUNCTION pg_llm_layernorm_backward(x BYTEA, dy BYTEA, gamma BYTEA, eps REAL)
 RETURNS RECORD
 AS '/workspace/pg_gpt2/pg_llm', 'pg_llm_layernorm_backward'
@@ -284,6 +294,24 @@ LATERAL (
     SELECT pg_llm_dropout(input, p, false) AS actual
 ) AS run;
 
+WITH fixture AS (
+    SELECT
+        decode('0000803f000000c00000000000004040', 'hex')::bytea AS x,
+        decode('6edbb63f000000000000000000000000', 'hex')::bytea AS y,
+        decode('0000003f0000c0bf00000040000000bf', 'hex')::bytea AS dy,
+        0.3::real AS p,
+        true AS training,
+        decode('6edb363f000000006edb364000000000', 'hex')::bytea AS expected_dx
+)
+SELECT 'dropout backward' AS label,
+       encode(actual, 'hex') AS actual_hex,
+       encode(expected_dx, 'hex') AS expected_hex,
+       actual = expected_dx AS matches
+FROM fixture,
+LATERAL (
+    SELECT pg_llm_dropout_backward(x, y, dy, p, training) AS actual
+) AS run;
+
 -- Attention --------------------------------------------------------------
 WITH fixture AS (
     SELECT
@@ -306,6 +334,34 @@ FROM fixture,
 LATERAL (
     SELECT pg_llm_attention(x, w_qkv, b_qkv, w_o, b_o, 2, 2, 4) AS actual
 ) AS run;
+
+CREATE TEMP TABLE attention_fixture_ones (
+    x BYTEA,
+    w_qkv BYTEA,
+    b_qkv BYTEA,
+    w_o BYTEA,
+    b_o BYTEA,
+    dy BYTEA,
+    expected_dx BYTEA,
+    expected_dw_qkv BYTEA,
+    expected_db_qkv BYTEA,
+    expected_dw_o BYTEA,
+    expected_db_o BYTEA
+);
+
+INSERT INTO attention_fixture_ones VALUES (
+    decode('5151fe3e28950dbeebce253fa4f2c23fe7c56fbe99c16fbea523ca3f9a76443f', 'hex'),
+    decode('f25ef0be37e50a3f1545edbe2174eebef5c4773e5ee6f4bf1ccadcbf13f20fbf73a481bf07e5a03e447468bf5ec6b4bf619abb3fe73167be3a4c8a3d265eb6bfab5c0bbf622be33dc25393bf7e5bc03e75c319bfe25895be72091abf7417ed3f77235dbc126387bf4e92523f9b449cbf57e0553e78d6fabf0002aabffe95493e250c3d3f2b7b2f3e02d9ecbd432a9abe3540bdbfb64738bfd8d8ebbec84f873fbdeeaf3e4dabe1bf56eea53e8129c5bec34a2dbfd1961c3fcbf7833f60686e3f', 'hex'),
+    decode('0ad7233c0ad7a3bc8fc2f53c0ad723bdcdcc4c3d8fc275bd295c8f3d0ad7a3bdec51b83dcdccccbdae47e13d8fc2f5bd', 'hex'),
+    decode('f6d656bf16519ebe5c9ba93e53bd793f5356f5be631d3ebe629c8dbf4c1d99bfb101503f4699ad3f0b7a93bdc473803f5b28b93e912625bfd808b93e62dec43f', 'hex'),
+    decode('0ad7a33b8fc275bccdcccc3c295c0fbd', 'hex'),
+    decode('0000803f0000803f0000803f0000803f0000803f0000803f0000803f0000803f', 'hex'),
+    decode('66cd34c177d83a4005e44bc0e11d6040aaf569bf48f46a3fb440243ff784ee3f', 'hex'),
+    decode('05c71e3c771f3bbdb2e74bbbbce0c23cd32b613e4422bd3e9a42bf3d77b67fbd3355073e6f791ec015cc0e40e7db943f2cc41e3c1b1c3bbd09e44bbb3cddc23c134cec3cab7a463df7b5483c8f2c06bcb2ea40bdafe7613f62f977bf194001bf3adb85bdbac09d3ea4e6ab3c664a24bed57e8fbe430ff1be19c5f3bd76f5a23d6bf1723e293e8ec0db20a3409e0d2a40061902bdc052193ef612273c6cad9fbd20ca683e7188c33e28bbc53da12e84bd87ade93e6cd108c1530f0941cbe08e40', 'hex'),
+    decode('dc8529bd64c9473e60b4593c0411d0bd0000003400008034000080b200000032002ea23e77e9bdc0216bc64067d74e40', 'hex'),
+    decode('505faabf505faabf505faabf505faabf58c60a4058c60a4058c60a4058c60a40766f1a40766f1a40766f1a40766f1a407cc6783e7cc6783e7cc6783e7cc6783e', 'hex'),
+    decode('00000040000000400000004000000040', 'hex')
+);
 
 WITH fixture AS (
     SELECT
@@ -341,3 +397,87 @@ FROM fixture,
 LATERAL (
     SELECT (pg_llm_attention_backward(x, w_qkv, b_qkv, w_o, b_o, dy, 2, 2, 4)).*
 ) AS run(dx, dw_qkv, db_qkv, dw_o, db_o);
+
+WITH fixture AS (
+    SELECT * FROM attention_fixture_ones
+)
+SELECT 'attention backward (dy=ones)' AS label,
+       encode(dx, 'hex') AS dx_hex,
+       encode(expected_dx, 'hex') AS expected_dx_hex,
+       encode(dw_qkv, 'hex') AS dw_qkv_hex,
+       encode(expected_dw_qkv, 'hex') AS expected_dw_qkv_hex,
+       encode(db_qkv, 'hex') AS db_qkv_hex,
+       encode(expected_db_qkv, 'hex') AS expected_db_qkv_hex,
+       encode(dw_o, 'hex') AS dw_o_hex,
+       encode(expected_dw_o, 'hex') AS expected_dw_o_hex,
+       encode(db_o, 'hex') AS db_o_hex,
+       encode(expected_db_o, 'hex') AS expected_db_o_hex,
+       dx = expected_dx AS dx_match,
+       dw_qkv = expected_dw_qkv AS dw_qkv_match,
+       db_qkv = expected_db_qkv AS db_qkv_match,
+       dw_o = expected_dw_o AS dw_o_match,
+       db_o = expected_db_o AS db_o_match
+FROM fixture,
+LATERAL (
+    SELECT (pg_llm_attention_backward(x, w_qkv, b_qkv, w_o, b_o, dy, 2, 2, 4)).*
+) AS run(dx, dw_qkv, db_qkv, dw_o, db_o);
+
+CREATE UNLOGGED TABLE IF NOT EXISTS llm_tape (
+    id SERIAL PRIMARY KEY,
+    name TEXT,
+    inputs INT[],
+    output INT,
+    extra JSONB
+);
+
+CREATE UNLOGGED TABLE IF NOT EXISTS llm_autograd_mode (
+    flag BOOL NOT NULL
+);
+
+CREATE UNLOGGED TABLE IF NOT EXISTS llm_tensor_rt (
+    id SERIAL PRIMARY KEY,
+    data BYTEA,
+    grad BYTEA,
+    shape INT[],
+    requires_grad BOOL DEFAULT false
+);
+
+TRUNCATE llm_tape;
+TRUNCATE llm_tensor_rt;
+DELETE FROM llm_autograd_mode;
+INSERT INTO llm_autograd_mode(flag) VALUES(true);
+
+SELECT 'autograd attention forward' AS label,
+       COUNT(*) AS calls
+FROM (
+    SELECT pg_llm_attention(x, w_qkv, b_qkv, w_o, b_o, 2, 2, 4)
+    FROM attention_fixture_ones
+) AS run;
+
+DO $$
+BEGIN
+    PERFORM llm_backprop((SELECT MAX(id) FROM llm_tape));
+END$$;
+
+WITH fixture AS (
+    SELECT * FROM attention_fixture_ones
+)
+SELECT 'llm_backprop attention (dy=ones)' AS label,
+       encode((SELECT grad FROM llm_tensor_rt WHERE data = fixture.x), 'hex') AS dx_hex,
+       encode(fixture.expected_dx, 'hex') AS expected_dx_hex,
+       encode((SELECT grad FROM llm_tensor_rt WHERE data = fixture.w_qkv), 'hex') AS dw_qkv_hex,
+       encode(fixture.expected_dw_qkv, 'hex') AS expected_dw_qkv_hex,
+       encode((SELECT grad FROM llm_tensor_rt WHERE data = fixture.b_qkv), 'hex') AS db_qkv_hex,
+       encode(fixture.expected_db_qkv, 'hex') AS expected_db_qkv_hex,
+       encode((SELECT grad FROM llm_tensor_rt WHERE data = fixture.w_o), 'hex') AS dw_o_hex,
+       encode(fixture.expected_dw_o, 'hex') AS expected_dw_o_hex,
+       encode((SELECT grad FROM llm_tensor_rt WHERE data = fixture.b_o), 'hex') AS db_o_hex,
+       encode(fixture.expected_db_o, 'hex') AS expected_db_o_hex,
+       (SELECT grad FROM llm_tensor_rt WHERE data = fixture.x) = fixture.expected_dx AS dx_match,
+       (SELECT grad FROM llm_tensor_rt WHERE data = fixture.w_qkv) = fixture.expected_dw_qkv AS dw_qkv_match,
+       (SELECT grad FROM llm_tensor_rt WHERE data = fixture.b_qkv) = fixture.expected_db_qkv AS db_qkv_match,
+       (SELECT grad FROM llm_tensor_rt WHERE data = fixture.w_o) = fixture.expected_dw_o AS dw_o_match,
+       (SELECT grad FROM llm_tensor_rt WHERE data = fixture.b_o) = fixture.expected_db_o AS db_o_match;
+
+DELETE FROM llm_autograd_mode;
+
