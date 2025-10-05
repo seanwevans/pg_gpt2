@@ -227,18 +227,19 @@ BEGIN
     WHERE llm_param.model = model;
 
     lr := pg_llm_lr_schedule(step_count, warmup, total_steps, lr_max);
-
-    loss := llm_loss(model, seq, target, n_layer, n_head, D, vocab,
-                     dropout_p => dropout_p,
-                     training => true);
     -- Reset autograd state from the previous step
     DELETE FROM llm_tape;
     DELETE FROM llm_tensor_rt;
     DELETE FROM llm_autograd_mode;
 
+    -- Populate cached tensors for the forward pass
+    PERFORM llm_materialize_params(model);
+
     -- Forward pass with autograd recording enabled
     INSERT INTO llm_autograd_mode(flag) VALUES(true);
-    loss := llm_loss(model, seq, target, n_layer, n_head, D, vocab);
+    loss := llm_loss(model, seq, target, n_layer, n_head, D, vocab,
+                     dropout_p => dropout_p,
+                     training => true);
     DELETE FROM llm_autograd_mode;
 
     SELECT MAX(id) INTO tape_top FROM llm_tape;
@@ -399,6 +400,46 @@ CREATE UNLOGGED TABLE llm_tensor_map (
     PRIMARY KEY (model, name, token_id)
 );
 
+CREATE OR REPLACE FUNCTION llm_materialize_params(p_model TEXT)
+RETURNS VOID AS $$
+DECLARE
+    rec RECORD;
+    tensor_name TEXT;
+    tensor_id INT;
+BEGIN
+    -- Clear cached tensors for this step
+    DELETE FROM llm_tensor;
+    DELETE FROM llm_tensor_map WHERE model = p_model;
+
+    -- Copy parameters into the tensor cache and create runtime tensors
+    FOR rec IN
+        SELECT name, token_id, data
+        FROM llm_param
+        WHERE model = p_model
+    LOOP
+        tensor_name := CASE
+                           WHEN rec.token_id = 0 THEN rec.name
+                           ELSE format('%s.%s', rec.name, rec.token_id)
+                       END;
+
+        INSERT INTO llm_tensor(name, data, requires_grad)
+        VALUES (tensor_name, rec.data, true)
+        ON CONFLICT (name) DO UPDATE
+            SET data = EXCLUDED.data,
+                requires_grad = EXCLUDED.requires_grad;
+
+        INSERT INTO llm_tensor_rt(data, grad, shape, requires_grad)
+        VALUES (rec.data, NULL, NULL, true)
+        RETURNING id INTO tensor_id;
+
+        INSERT INTO llm_tensor_map(model, name, token_id, tensor_id)
+        VALUES (p_model, rec.name, rec.token_id, tensor_id)
+        ON CONFLICT (model, name, token_id) DO UPDATE
+            SET tensor_id = EXCLUDED.tensor_id;
+    END LOOP;
+END;
+$$ LANGUAGE plpgsql;
+
 CREATE OR REPLACE FUNCTION llm_accumulate_grads(p_model TEXT)
 RETURNS VOID AS $$
 BEGIN
@@ -415,7 +456,8 @@ BEGIN
     WHERE p.model = p_model
       AND p.model = m.model
       AND p.name = m.name
-      AND p.token_id = m.token_id;
+      AND p.token_id = m.token_id
+      AND t.grad IS NOT NULL;
 END;
 $$ LANGUAGE plpgsql;
 
