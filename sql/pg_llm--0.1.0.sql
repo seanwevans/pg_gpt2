@@ -284,7 +284,7 @@ BEGIN
         RAISE EXCEPTION 'Autograd tape empty after forward pass for step %', step_count;
     END IF;
 
-    PERFORM llm_backprop(tape_top);
+    PERFORM llm_backprop(tape_top, model);
     PERFORM llm_accumulate_grads(model);
 
     UPDATE llm_param
@@ -531,7 +531,7 @@ BEGIN;
   PERFORM llm_loss('gpt2-small', seq, target, 12, 12, 768, 50257);
 
   -- Reverse pass
-  PERFORM llm_backprop((SELECT MAX(id) FROM llm_tape));
+  PERFORM llm_backprop((SELECT MAX(id) FROM llm_tape), 'gpt2-small');
 
   -- Gradient accumulation
   PERFORM llm_accumulate_grads('gpt2-small');

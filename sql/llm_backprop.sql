@@ -1,9 +1,16 @@
-CREATE OR REPLACE FUNCTION llm_backprop(start_id INT)
+CREATE OR REPLACE FUNCTION llm_backprop(start_id INT, p_model TEXT)
 RETURNS VOID AS $$
 DECLARE
     node RECORD;
     grad BYTEA;
     m INT; k INT; n INT;
+    b_grad BYTEA;
+    grad_rows BYTEA;
+    token_idx INT;
+    bytes_per_row INT;
+    wte_tensor_id INT;
+    chunk BYTEA;
+    has_mapping BOOLEAN;
     dx BYTEA;
     dw_qkv BYTEA;
     db_qkv BYTEA;
@@ -46,6 +53,42 @@ BEGIN
               SET grad = COALESCE(grad, pg_llm_zeros_like(data))
                         + pg_llm_matmul(pg_llm_transpose(a, m, k), grad, k,m,n)
               WHERE id=node.inputs[2];
+
+            SELECT EXISTS(
+                       SELECT 1
+                         FROM llm_tensor_map
+                        WHERE tensor_id = node.inputs[2]
+                          AND model = p_model) INTO has_mapping;
+
+            IF NOT has_mapping THEN
+                SELECT grad INTO b_grad FROM llm_tensor_rt WHERE id = node.inputs[2];
+
+                IF b_grad IS NOT NULL THEN
+                    grad_rows := pg_llm_transpose(b_grad, k, n);
+                    bytes_per_row := k * 4;
+
+                    FOR token_idx IN 0..(n-1) LOOP
+                        SELECT tensor_id INTO wte_tensor_id
+                          FROM llm_tensor_map
+                         WHERE model = p_model
+                           AND name = 'wte'
+                           AND token_id = token_idx;
+
+                        IF wte_tensor_id IS NULL THEN
+                            CONTINUE;
+                        END IF;
+
+                        chunk := substring(grad_rows FROM token_idx * bytes_per_row + 1 FOR bytes_per_row);
+
+                        UPDATE llm_tensor_rt
+                           SET grad = CASE
+                                          WHEN grad IS NULL THEN chunk
+                                          ELSE pg_llm_add(grad, chunk)
+                                      END
+                         WHERE id = wte_tensor_id;
+                    END LOOP;
+                END IF;
+            END IF;
         ELSIF node.name='softmax' THEN
             UPDATE llm_tensor_rt
               SET grad = pg_llm_softmax_backward(
