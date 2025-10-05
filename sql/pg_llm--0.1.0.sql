@@ -28,6 +28,11 @@ RETURNS FLOAT4
 AS 'MODULE_PATHNAME', 'pg_llm_cross_entropy'
 LANGUAGE C STRICT;
 
+CREATE FUNCTION pg_llm_dropout(input BYTEA, p FLOAT4, training BOOLEAN DEFAULT false)
+RETURNS BYTEA
+AS 'MODULE_PATHNAME', 'pg_llm_dropout'
+LANGUAGE C STRICT;
+
 CREATE FUNCTION pg_llm_attention(
     x BYTEA,
     w_qkv BYTEA,
@@ -119,7 +124,9 @@ BEGIN
         array_length(tokens,1),
         D,
         (SELECT data FROM llm_param p WHERE p.model = model AND p.name = 'ln_f.weight'),
-        (SELECT data FROM llm_param p WHERE p.model = model AND p.name = 'ln_f.bias'));
+        (SELECT data FROM llm_param p WHERE p.model = model AND p.name = 'ln_f.bias'),
+        dropout_p => 0.1::float4,
+        training => true);
 
     -- 3. Final linear projection (tie weights with token_emb)
     logits := pg_llm_matmul(x,

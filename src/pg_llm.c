@@ -1,5 +1,7 @@
 #include "pg_llm.h"
 
+extern Datum drandom(PG_FUNCTION_ARGS);
+
 PG_MODULE_MAGIC;
 
 PG_FUNCTION_INFO_V1(pg_llm_matmul);
@@ -8,6 +10,7 @@ PG_FUNCTION_INFO_V1(pg_llm_gelu);
 PG_FUNCTION_INFO_V1(pg_llm_softmax);
 PG_FUNCTION_INFO_V1(pg_llm_layernorm);
 PG_FUNCTION_INFO_V1(pg_llm_cross_entropy);
+PG_FUNCTION_INFO_V1(pg_llm_dropout);
 
 /* ------------------ MATMUL ------------------ */
 Datum pg_llm_matmul(PG_FUNCTION_ARGS)
@@ -218,4 +221,60 @@ Datum pg_llm_cross_entropy(PG_FUNCTION_ARGS)
 
     loss = log_sum - z[target];  /* −log softmax[target] */
     PG_RETURN_FLOAT4(loss);
+}
+
+/* ------------------ DROPOUT ------------------ */
+Datum pg_llm_dropout(PG_FUNCTION_ARGS)
+{
+    bytea *input = PG_GETARG_BYTEA_P(0);
+    float4 p = PG_GETARG_FLOAT4(1);
+    bool training = PG_GETARG_BOOL(2);
+    int n;
+    bytea *out;
+    float *src;
+    float *dst;
+    float scale;
+    FmgrInfo flinfo;
+    LOCAL_FCINFO(random_fcinfo, 0);
+
+    if (p < 0.0f || p >= 1.0f)
+        ereport(ERROR,
+                (errmsg("pg_llm_dropout probability must be in [0, 1) (got %f)", p)));
+
+    n = float_length(input, "pg_llm_dropout");
+
+    if (!training || p == 0.0f || n == 0)
+        PG_RETURN_BYTEA_P(input);
+
+    flinfo.fn_addr = drandom;
+    flinfo.fn_oid = InvalidOid;
+    flinfo.fn_nargs = 0;
+    flinfo.fn_strict = false;
+    flinfo.fn_retset = false;
+    flinfo.fn_stats = 0;
+    flinfo.fn_extra = NULL;
+    flinfo.fn_mcxt = CurrentMemoryContext;
+    flinfo.fn_expr = NULL;
+
+    InitFunctionCallInfoData(*random_fcinfo, &flinfo, 0, InvalidOid, NULL, NULL);
+
+    out = bytea_same_size(input);
+    src = as_float(input);
+    dst = as_float(out);
+    scale = 1.0f / (1.0f - p);
+
+    for (int i = 0; i < n; i++) {
+        Datum rand_datum;
+        double r;
+
+        random_fcinfo->isnull = false;
+        rand_datum = FunctionCallInvoke(random_fcinfo);
+        r = DatumGetFloat8(rand_datum);
+        if (r < p)
+            dst[i] = 0.0f;
+        else
+            dst[i] = src[i] * scale;
+    }
+
+    PG_RETURN_BYTEA_P(out);
 }
