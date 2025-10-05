@@ -465,6 +465,70 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+CREATE OR REPLACE FUNCTION llm_logits(
+    token_ids INT[],
+    model_name TEXT DEFAULT 'gpt2-small',
+    n_layer INT DEFAULT 12,
+    n_head INT DEFAULT 12,
+    d_model INT DEFAULT NULL,
+    vocab_size INT DEFAULT NULL)
+RETURNS BYTEA AS $$
+DECLARE
+    seq_len INT := COALESCE(array_length(token_ids, 1), 0);
+    x BYTEA;
+    weight_matrix BYTEA;
+BEGIN
+    IF seq_len = 0 THEN
+        RETURN ''::BYTEA;
+    END IF;
+
+    IF d_model IS NULL THEN
+        SELECT octet_length(p.data) / 4
+          INTO d_model
+          FROM llm_param p
+         WHERE p.model = model_name
+           AND p.name = 'wte'
+         ORDER BY p.token_id
+         LIMIT 1;
+    END IF;
+
+    IF d_model IS NULL THEN
+        RAISE EXCEPTION 'Missing token embeddings for model %', model_name;
+    END IF;
+
+    IF vocab_size IS NULL THEN
+        SELECT COUNT(*)
+          INTO vocab_size
+          FROM llm_param p
+         WHERE p.model = model_name
+           AND p.name = 'wte';
+    END IF;
+
+    x := llm_embed(token_ids, model_name, d_model);
+
+    x := llm_forward_gpt2(
+        x,
+        n_layer,
+        n_head,
+        seq_len,
+        d_model,
+        dropout_p => 0.0::float4,
+        training => false);
+
+    SELECT string_agg(p.data::TEXT, '' ORDER BY p.token_id)::BYTEA
+      INTO weight_matrix
+      FROM llm_param p
+     WHERE p.model = model_name
+       AND p.name = 'wte';
+
+    IF weight_matrix IS NULL THEN
+        RAISE EXCEPTION 'Missing token embeddings for model %', model_name;
+    END IF;
+
+    RETURN pg_llm_matmul(x, weight_matrix, seq_len, d_model, vocab_size);
+END;
+$$ LANGUAGE plpgsql;
+
 CREATE OR REPLACE FUNCTION llm_decode(ids INT[], model TEXT)
 RETURNS TEXT AS $$
 DECLARE
