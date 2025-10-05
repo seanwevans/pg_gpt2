@@ -51,6 +51,8 @@ LANGUAGE C STRICT;
 CREATE FUNCTION pg_llm_transpose(src BYTEA, rows INT, cols INT)
 RETURNS BYTEA
 AS 'MODULE_PATHNAME', 'pg_llm_transpose'
+LANGUAGE C STRICT;
+
 CREATE FUNCTION pg_llm_dropout_backward(
     input BYTEA,
     output BYTEA,
@@ -72,6 +74,28 @@ CREATE FUNCTION pg_llm_attention(
     D INT)
 RETURNS BYTEA
 AS 'MODULE_PATHNAME', 'pg_llm_attention'
+LANGUAGE C STRICT;
+
+CREATE TYPE attention_grads AS (
+    dx BYTEA,
+    dw_qkv BYTEA,
+    db_qkv BYTEA,
+    dw_o BYTEA,
+    db_o BYTEA
+);
+
+CREATE FUNCTION pg_llm_attention_backward(
+    x BYTEA,
+    w_qkv BYTEA,
+    b_qkv BYTEA,
+    w_o BYTEA,
+    b_o BYTEA,
+    grad_output BYTEA,
+    n_head INT,
+    T INT,
+    D INT)
+RETURNS attention_grads
+AS 'MODULE_PATHNAME', 'pg_llm_attention_backward'
 LANGUAGE C STRICT;
 
 -- AdamW optimizer step
@@ -173,7 +197,10 @@ BEGIN
         dropout_p => dropout_p,
         training => training);
 
-    -- 3. Final linear projection (tie weights with token_emb)
+    -- 3. Final linear projection (tie weights with token_emb).
+    --    When this concatenated matrix is handed to the matmul kernel the
+    --    runtime id must be registered via pg_llm_autograd_map_param so the
+    --    logits gradient is accumulated back into each `wte` row.
     logits := pg_llm_matmul(x,
         (SELECT string_agg(p.data::TEXT, '' ORDER BY p.token_id)::BYTEA
          FROM llm_param p
