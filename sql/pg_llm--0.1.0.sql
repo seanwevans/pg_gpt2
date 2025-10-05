@@ -196,7 +196,10 @@ BEGIN
         dropout_p => dropout_p,
         training => training);
 
-    -- 3. Final linear projection (tie weights with token_emb)
+    -- 3. Final linear projection (tie weights with token_emb).
+    --    When this concatenated matrix is handed to the matmul kernel the
+    --    runtime id must be registered via pg_llm_autograd_map_param so the
+    --    logits gradient is accumulated back into each `wte` row.
     logits := pg_llm_matmul(x,
         (SELECT string_agg(p.data::TEXT, '' ORDER BY p.token_id)::BYTEA
          FROM llm_param p
