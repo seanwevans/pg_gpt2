@@ -1,5 +1,7 @@
 #include "pg_llm.h"
 
+#define PG_LLM_ATTENTION_CHUNK 64
+
 /*
  * Multi-head self-attention
  * args:
@@ -35,82 +37,116 @@ Datum pg_llm_attention(PG_FUNCTION_ARGS)
     const float scale = 1.0f / sqrtf((float)head_dim);
     bytea *out;
     float *Y;
+    float *qkv;
     float *Q;
     float *K;
     float *V;
-    float *tmp;
+    float *Q_chunk;
+    float *score_chunk;
+    float *context_chunk;
+    float *proj;
+    const int chunk_rows = Min(PG_LLM_ATTENTION_CHUNK, (int)T);
 
     out = (bytea*) palloc(T*D*sizeof(float) + VARHDRSZ);
     SET_VARSIZE(out, T*D*sizeof(float) + VARHDRSZ);
     Y = as_float(out);
 
-    /* 1. Q,K,V = x @ W_qkv, then split */
-    Q = palloc(T * D * sizeof(float));
-    K = palloc(T * D * sizeof(float));
-    V = palloc(T * D * sizeof(float));
-    for (int t=0; t<T; ++t) {
-        for (int j=0; j<3*D; ++j) {
-            float s = 0.0f;
-            for (int k=0; k<D; ++k)
-                s += x[t*D + k] * w_qkv[k*3*D + j];
-            if (j < D)
-                Q[t*D + j] = s + b_qkv[j];
-            else if (j < 2*D)
-                K[t*D + (j - D)] = s + b_qkv[j];
-            else
-                V[t*D + (j - 2*D)] = s + b_qkv[j];
-        }
+    /* 1. Compute Q,K,V using the optimized GEMM */
+    qkv = (float *) palloc((Size)T * 3 * D * sizeof(float));
+    pg_llm_fast_gemm(x, w_qkv, qkv, T, D, 3 * D);
+    for (int t = 0; t < T; ++t) {
+        float *row = qkv + (Size)t * 3 * D;
+        for (int j = 0; j < 3 * D; ++j)
+            row[j] += b_qkv[j];
     }
+    Q = qkv;
+    K = qkv + (Size)T * D;
+    V = qkv + (Size)2 * T * D;
 
-    /* 2. iterate heads */
-    for (int h=0; h<n_head; ++h) {
-        int off = h*head_dim;
-        /* compute attention weights: (T×head_dim) × (head_dim×T) */
-        for (int i=0; i<T; ++i) {
-            int q_base = i*D + off;
-            float scores[1024]; /* max ctx len = 1024 */
-            float maxs = -1e9f;
-            float sum;
-            for (int j=0;j<=i;++j){          /* causal mask */
-                int k_base = j*D + off;
-                float dot = 0;
-                for(int d=0;d<head_dim;++d)
-                    dot += Q[q_base + d]*K[k_base + d];
-                dot *= scale;
-                scores[j]=dot;
-                if(dot>maxs)maxs=dot;
+    Q_chunk = (float *) palloc((Size)chunk_rows * head_dim * sizeof(float));
+    score_chunk = (float *) palloc((Size)chunk_rows * T * sizeof(float));
+    context_chunk = (float *) palloc((Size)chunk_rows * head_dim * sizeof(float));
+
+    /* 2. Iterate heads with chunked GEMMs to limit peak memory */
+    for (int h = 0; h < n_head; ++h) {
+        int off = h * head_dim;
+        float *K_head_T = (float *) palloc((Size)head_dim * T * sizeof(float));
+        float *V_head = (float *) palloc((Size)T * head_dim * sizeof(float));
+
+        for (int t = 0; t < T; ++t) {
+            const float *k_src = K + (Size)t * D + off;
+            const float *v_src = V + (Size)t * D + off;
+            float *v_dst = V_head + (Size)t * head_dim;
+            memcpy(v_dst, v_src, head_dim * sizeof(float));
+            for (int d = 0; d < head_dim; ++d)
+                K_head_T[(Size)d * T + t] = k_src[d];
+        }
+
+        for (int base = 0; base < T; base += chunk_rows) {
+            int rows = Min(chunk_rows, (int)T - base);
+
+            for (int r = 0; r < rows; ++r) {
+                const float *src = Q + (Size)(base + r) * D + off;
+                memcpy(Q_chunk + (Size)r * head_dim, src, head_dim * sizeof(float));
             }
-            /* softmax */
-            sum = 0;
-            for(int j=0;j<=i;++j){ scores[j]=expf(scores[j]-maxs); sum+=scores[j]; }
-            for(int j=0;j<=i;++j) scores[j]/=sum;
 
-            /* weighted sum over V */
-            for(int d=0;d<head_dim;++d){
-                float acc=0;
-                for(int j=0;j<=i;++j){
-                    int v_base = j*D + off;
-                    acc += scores[j]*V[v_base + d];
+            pg_llm_fast_gemm(Q_chunk, K_head_T, score_chunk, rows, head_dim, T);
+
+            for (int r = 0; r < rows; ++r) {
+                int global_row = base + r;
+                float *row = score_chunk + (Size)r * T;
+                int valid = global_row + 1;
+                float maxv = -INFINITY;
+                for (int j = 0; j < T; ++j) {
+                    if (j < valid) {
+                        row[j] *= scale;
+                        if (row[j] > maxv)
+                            maxv = row[j];
+                    } else {
+                        row[j] = 0.0f;
+                    }
                 }
-                Y[q_base + d] = acc;
+                float sum = 0.0f;
+                for (int j = 0; j < valid; ++j) {
+                    row[j] = expf(row[j] - maxv);
+                    sum += row[j];
+                }
+                if (sum <= 0.0f)
+                    sum = 1.0f;
+                float inv_sum = 1.0f / sum;
+                for (int j = 0; j < valid; ++j)
+                    row[j] *= inv_sum;
+                for (int j = valid; j < T; ++j)
+                    row[j] = 0.0f;
+            }
+
+            pg_llm_fast_gemm(score_chunk, V_head, context_chunk, rows, T, head_dim);
+
+            for (int r = 0; r < rows; ++r) {
+                float *dst = Y + (Size)(base + r) * D + off;
+                memcpy(dst, context_chunk + (Size)r * head_dim,
+                       head_dim * sizeof(float));
             }
         }
+
+        pfree(K_head_T);
+        pfree(V_head);
     }
 
     /* 3. project output: Y = Y @ W_o */
-    tmp = palloc(T * D * sizeof(float));
-    for (int i=0; i<T; ++i) {
-        for (int j=0; j<D; ++j){
-            float s = 0;
-            for (int k=0;k<D;++k)
-                s += Y[i*D + k]*w_o[k*D + j];
-            tmp[i*D + j]=s + b_o[j];
-        }
+    proj = (float *) palloc((Size)T * D * sizeof(float));
+    pg_llm_fast_gemm(Y, w_o, proj, T, D, D);
+    for (int t = 0; t < T; ++t) {
+        float *dst = proj + (Size)t * D;
+        for (int j = 0; j < D; ++j)
+            dst[j] += b_o[j];
     }
-    memcpy(Y,tmp,T*D*sizeof(float));
-    pfree(tmp);
-    pfree(Q);
-    pfree(K);
-    pfree(V);
+    memcpy(Y, proj, (Size)T * D * sizeof(float));
+
+    pfree(proj);
+    pfree(context_chunk);
+    pfree(score_chunk);
+    pfree(Q_chunk);
+    pfree(qkv);
     PG_RETURN_BYTEA_P(out);
 }
