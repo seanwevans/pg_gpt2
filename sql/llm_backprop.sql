@@ -6,6 +6,7 @@ DECLARE
     a_id INT; b_id INT;
     a BYTEA; b BYTEA;
     m INT; k INT; n INT;
+    dx BYTEA; dgamma BYTEA; dbeta BYTEA;
 BEGIN
     -- seed gradient of final output = 1
     UPDATE llm_tensor_rt SET grad = pg_llm_ones_like(data) WHERE id=start_id;
@@ -59,13 +60,22 @@ BEGIN
               WHERE id=node.inputs[1];
 
         ELSIF node.name='layernorm' THEN
-            PERFORM (SELECT dx, dgamma, dbeta
+            SELECT dx, dgamma, dbeta INTO dx, dgamma, dbeta
              FROM pg_llm_layernorm_backward(
                  (SELECT data FROM llm_tensor_rt WHERE id=node.inputs[1]),
                  (SELECT grad FROM llm_tensor_rt WHERE id=node.output),
-                 (SELECT data FROM llm_tensor_rt WHERE id=node.extra->>'gamma_id'),
-                 (node.extra->>'eps')::FLOAT4));
-    -- accumulate dx→input.grad, dγ→γ.grad, dβ→β.grad
+                 (SELECT data FROM llm_tensor_rt WHERE id=(node.extra->>'gamma_id')::INT),
+                 (node.extra->>'eps')::FLOAT4);
+
+            UPDATE llm_tensor_rt
+              SET grad = COALESCE(grad, pg_llm_zeros_like(data)) + dx
+              WHERE id=node.inputs[1];
+            UPDATE llm_tensor_rt
+              SET grad = COALESCE(grad, pg_llm_zeros_like(data)) + dgamma
+              WHERE id=(node.extra->>'gamma_id')::INT;
+            UPDATE llm_tensor_rt
+              SET grad = COALESCE(grad, pg_llm_zeros_like(data)) + dbeta
+              WHERE id=(node.extra->>'beta_id')::INT;
         ELSIF node.name='gelu' THEN
             UPDATE llm_tensor_rt
               SET grad = COALESCE(grad, pg_llm_zeros_like(data))
