@@ -46,6 +46,14 @@ LANGUAGE C STRICT;
 CREATE FUNCTION pg_llm_transpose(src BYTEA, rows INT, cols INT)
 RETURNS BYTEA
 AS 'MODULE_PATHNAME', 'pg_llm_transpose'
+CREATE FUNCTION pg_llm_dropout_backward(
+    input BYTEA,
+    output BYTEA,
+    grad BYTEA,
+    p FLOAT4,
+    training BOOLEAN)
+RETURNS BYTEA
+AS 'MODULE_PATHNAME', 'pg_llm_dropout_backward'
 LANGUAGE C STRICT;
 
 CREATE FUNCTION pg_llm_attention(
@@ -96,6 +104,15 @@ CREATE TABLE llm_param (
     PRIMARY KEY (model, name, token_id)
 );
 
+-- Materialized tensors used during the forward pass (activations, cached weights)
+CREATE UNLOGGED TABLE llm_tensor (
+    id SERIAL PRIMARY KEY,
+    name TEXT UNIQUE,
+    data BYTEA,
+    shape INT[],
+    requires_grad BOOL DEFAULT false
+);
+
 CREATE TABLE llm_train_log (
     model TEXT,
     step INT,
@@ -121,7 +138,9 @@ CREATE OR REPLACE FUNCTION llm_loss(
     n_layer INT,
     n_head INT,
     D INT,
-    vocab INT)
+    vocab INT,
+    dropout_p FLOAT4 DEFAULT 0.1,
+    training BOOLEAN DEFAULT true)
 RETURNS FLOAT4 AS $$
 DECLARE
     x BYTEA;
@@ -140,8 +159,8 @@ BEGIN
         D,
         (SELECT data FROM llm_param p WHERE p.model = model AND p.name = 'ln_f.weight'),
         (SELECT data FROM llm_param p WHERE p.model = model AND p.name = 'ln_f.bias'),
-        dropout_p => 0.1::float4,
-        training => true);
+        dropout_p => dropout_p,
+        training => training);
 
     -- 3. Final linear projection (tie weights with token_emb)
     logits := pg_llm_matmul(x,
@@ -167,6 +186,7 @@ CREATE OR REPLACE FUNCTION llm_train_step(
     n_head INT,
     D INT,
     vocab INT,
+    dropout_p FLOAT4 DEFAULT 0.1,
     beta1 FLOAT4,
     beta2 FLOAT4,
     eps FLOAT4,
@@ -181,29 +201,56 @@ DECLARE
     step_count INT;
     lr FLOAT4;
     loss FLOAT4;
+    tape_top INT;
 BEGIN
-    SELECT tokens, target INTO seq, target FROM llm_dataset WHERE id=batch_id;
-    SELECT MAX(step) + 1 INTO step_count FROM llm_param WHERE model=model;
+    SELECT tokens, target INTO seq, target
+    FROM llm_dataset
+    WHERE id = batch_id;
+
+    IF seq IS NULL OR target IS NULL THEN
+        RAISE EXCEPTION 'No dataset row with id % for model %', batch_id, model;
+    END IF;
+
+    SELECT COALESCE(MAX(step), 0) + 1 INTO step_count
+    FROM llm_param
+    WHERE llm_param.model = model;
 
     lr := pg_llm_lr_schedule(step_count, warmup, total_steps, lr_max);
 
-    loss := llm_loss(model, seq, target, n_layer, n_head, D, vocab);
+    loss := llm_loss(model, seq, target, n_layer, n_head, D, vocab,
+                     dropout_p => dropout_p,
+                     training => true);
+    -- Reset autograd state from the previous step
+    DELETE FROM llm_tape;
+    DELETE FROM llm_tensor_rt;
+    DELETE FROM llm_autograd_mode;
 
-    -- In a full implementation, populate llm_param.grad here
-    -- For now, assume gradients already in llm_param.grad.
+    -- Forward pass with autograd recording enabled
+    INSERT INTO llm_autograd_mode(flag) VALUES(true);
+    loss := llm_loss(model, seq, target, n_layer, n_head, D, vocab);
+    DELETE FROM llm_autograd_mode;
+
+    SELECT MAX(id) INTO tape_top FROM llm_tape;
+    IF tape_top IS NULL THEN
+        RAISE EXCEPTION 'Autograd tape empty after forward pass for step %', step_count;
+    END IF;
+
+    PERFORM llm_backprop(tape_top);
+    PERFORM llm_accumulate_grads(model);
 
     UPDATE llm_param
-    SET (data, m, v, step) = (
-        SELECT s.weight, s.m, s.v, step_count
+    SET (data, m, v, grad, step) = (
+        SELECT s.weight, s.m, s.v, NULL::BYTEA, step_count
         FROM pg_llm_adamw_step(
             data, grad, m, v,
             lr, beta1, beta2, eps, wd, step_count
         ) AS s
     )
-    WHERE model = llm_param.model AND name = llm_param.name;
+    WHERE llm_param.model = model;
 
     INSERT INTO llm_train_log(model, step, lr, loss)
     VALUES(model, step_count, lr, loss);
+
     RETURN loss;
 END;
 $$ LANGUAGE plpgsql;
@@ -255,6 +302,7 @@ CREATE OR REPLACE FUNCTION llm_train(
     n_head INT,
     D INT,
     vocab INT,
+    dropout_p FLOAT4 DEFAULT 0.1,
     beta1 FLOAT4 DEFAULT 0.9,
     beta2 FLOAT4 DEFAULT 0.999,
     eps FLOAT4 DEFAULT 1e-8,
@@ -264,13 +312,38 @@ CREATE OR REPLACE FUNCTION llm_train(
 RETURNS VOID AS $$
 DECLARE
     loss FLOAT4;
+    dataset_ids INT[];
+    dataset_size INT;
+    idx INT := 1;
+    batch_id INT;
 BEGIN
+    SELECT array_agg(id ORDER BY random()) INTO dataset_ids FROM llm_dataset;
+    dataset_size := COALESCE(array_length(dataset_ids, 1), 0);
+
+    IF dataset_size = 0 THEN
+        RAISE EXCEPTION 'llm_dataset is empty; cannot train model %', model;
+    END IF;
+
     FOR i IN 1..n_steps LOOP
+        IF idx > dataset_size THEN
+            SELECT array_agg(id ORDER BY random()) INTO dataset_ids FROM llm_dataset;
+            dataset_size := COALESCE(array_length(dataset_ids, 1), 0);
+            IF dataset_size = 0 THEN
+                RAISE EXCEPTION 'llm_dataset became empty during training for model %', model;
+            END IF;
+            idx := 1;
+        END IF;
+
+        batch_id := dataset_ids[idx];
+        idx := idx + 1;
+
         loss := llm_train_step(
-            model, (i % (SELECT COUNT(*) FROM llm_dataset))+1,
+            model, batch_id,
             n_layer, n_head, D, vocab,
+            dropout_p,
             beta1, beta2, eps, wd,
             lr_max, warmup, n_steps);
+
         RAISE NOTICE 'step %/% loss=%', i, n_steps, loss;
     END LOOP;
 END;
@@ -294,15 +367,32 @@ CREATE UNLOGGED TABLE llm_tensor_rt (
     requires_grad BOOL DEFAULT false
 );
 
-CREATE OR REPLACE FUNCTION llm_accumulate_grads(model TEXT)
+-- Mapping from model parameters to runtime tensor ids for autograd
+CREATE UNLOGGED TABLE llm_tensor_map (
+    model TEXT,
+    name TEXT,
+    token_id INT DEFAULT 0 NOT NULL,
+    tensor_id INT REFERENCES llm_tensor_rt(id) ON DELETE CASCADE,
+    PRIMARY KEY (model, name, token_id)
+);
+
+CREATE OR REPLACE FUNCTION llm_accumulate_grads(p_model TEXT)
 RETURNS VOID AS $$
 BEGIN
+    -- Clear stale gradients for this model
+    UPDATE llm_param
+    SET grad = NULL
+    WHERE model = p_model;
+
+    -- Populate grads from runtime tensors recorded during autograd
     UPDATE llm_param p
-    SET grad = (
-        SELECT grad FROM llm_tensor_rt t
-        WHERE t.id = (SELECT id FROM llm_tensor_map WHERE model=p.model AND name=p.name)
-    )
-    WHERE model=p.model;
+    SET grad = t.grad
+    FROM llm_tensor_map m
+    JOIN llm_tensor_rt t ON t.id = m.tensor_id
+    WHERE p.model = p_model
+      AND p.model = m.model
+      AND p.name = m.name
+      AND p.token_id = m.token_id;
 END;
 $$ LANGUAGE plpgsql;
 
@@ -477,6 +567,70 @@ BEGIN
         SELECT token_id FROM llm_bpe_vocab
         WHERE token=ANY(tokens) ORDER BY array_position(tokens,token)
     );
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION llm_logits(
+    token_ids INT[],
+    model_name TEXT DEFAULT 'gpt2-small',
+    n_layer INT DEFAULT 12,
+    n_head INT DEFAULT 12,
+    d_model INT DEFAULT NULL,
+    vocab_size INT DEFAULT NULL)
+RETURNS BYTEA AS $$
+DECLARE
+    seq_len INT := COALESCE(array_length(token_ids, 1), 0);
+    x BYTEA;
+    weight_matrix BYTEA;
+BEGIN
+    IF seq_len = 0 THEN
+        RETURN ''::BYTEA;
+    END IF;
+
+    IF d_model IS NULL THEN
+        SELECT octet_length(p.data) / 4
+          INTO d_model
+          FROM llm_param p
+         WHERE p.model = model_name
+           AND p.name = 'wte'
+         ORDER BY p.token_id
+         LIMIT 1;
+    END IF;
+
+    IF d_model IS NULL THEN
+        RAISE EXCEPTION 'Missing token embeddings for model %', model_name;
+    END IF;
+
+    IF vocab_size IS NULL THEN
+        SELECT COUNT(*)
+          INTO vocab_size
+          FROM llm_param p
+         WHERE p.model = model_name
+           AND p.name = 'wte';
+    END IF;
+
+    x := llm_embed(token_ids, model_name, d_model);
+
+    x := llm_forward_gpt2(
+        x,
+        n_layer,
+        n_head,
+        seq_len,
+        d_model,
+        dropout_p => 0.0::float4,
+        training => false);
+
+    SELECT string_agg(p.data::TEXT, '' ORDER BY p.token_id)::BYTEA
+      INTO weight_matrix
+      FROM llm_param p
+     WHERE p.model = model_name
+       AND p.name = 'wte';
+
+    IF weight_matrix IS NULL THEN
+        RAISE EXCEPTION 'Missing token embeddings for model %', model_name;
+    END IF;
+
+    RETURN pg_llm_matmul(x, weight_matrix, seq_len, d_model, vocab_size);
 END;
 $$ LANGUAGE plpgsql;
 

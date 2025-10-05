@@ -50,14 +50,7 @@ Datum pg_llm_matmul(PG_FUNCTION_ARGS)
     out = bytea_alloc(out_bytes);
     C = as_float(out);
 
-    for (int i = 0; i < m; i++) {
-        for (int j = 0; j < n; j++) {
-            float sum = 0.0f;
-            for (int t = 0; t < k; t++)
-                sum += A[i*k + t] * B[t*n + j];
-            C[i*n + j] = sum;
-        }
-    }
+    pg_llm_fast_gemm(A, B, C, m, k, n);
     PG_RETURN_BYTEA_P(out);
 }
 

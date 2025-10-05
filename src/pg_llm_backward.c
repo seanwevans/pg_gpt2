@@ -1,7 +1,13 @@
 #include "pg_llm.h"
+#include <string.h>
 
 PG_FUNCTION_INFO_V1(pg_llm_gelu_backward);
-Datum pg_llm_gelu_backward(PG_FUNCTION_ARGS)
+PG_FUNCTION_INFO_V1(pg_llm_softmax_backward);
+PG_FUNCTION_INFO_V1(pg_llm_layernorm_backward);
+PG_FUNCTION_INFO_V1(pg_llm_dropout_backward);
+
+Datum
+pg_llm_gelu_backward(PG_FUNCTION_ARGS)
 {
     bytea *x_b = PG_GETARG_BYTEA_P(0);
     bytea *dy_b= PG_GETARG_BYTEA_P(1);
@@ -33,8 +39,8 @@ Datum pg_llm_gelu_backward(PG_FUNCTION_ARGS)
 /* ----------------------------------------------------------
  *  Softmax backward
  * ---------------------------------------------------------- */
-PG_FUNCTION_INFO_V1(pg_llm_softmax_backward);
-Datum pg_llm_softmax_backward(PG_FUNCTION_ARGS)
+Datum
+pg_llm_softmax_backward(PG_FUNCTION_ARGS)
 {
     bytea *y_b  = PG_GETARG_BYTEA_P(0);  /* output of softmax */
     bytea *dy_b = PG_GETARG_BYTEA_P(1);  /* upstream gradient */
@@ -61,10 +67,62 @@ Datum pg_llm_softmax_backward(PG_FUNCTION_ARGS)
 }
 
 /* ----------------------------------------------------------
+ *  Dropout backward
+ * ---------------------------------------------------------- */
+Datum
+pg_llm_dropout_backward(PG_FUNCTION_ARGS)
+{
+    bytea *x_b = PG_GETARG_BYTEA_P(0);
+    bytea *y_b = PG_GETARG_BYTEA_P(1);
+    bytea *dy_b = PG_GETARG_BYTEA_P(2);
+    float4 p = PG_GETARG_FLOAT4(3);
+    bool training = PG_GETARG_BOOL(4);
+    int n;
+    bytea *out;
+    float *x;
+    float *y;
+    float *dy;
+    float *dx;
+
+    if (p < 0.0f || p >= 1.0f)
+        ereport(ERROR,
+                (errmsg("pg_llm_dropout_backward probability must be in [0, 1) (got %f)", p)));
+
+    ensure_same_size(x_b, y_b, "pg_llm_dropout_backward");
+    ensure_same_size(x_b, dy_b, "pg_llm_dropout_backward");
+
+    n = float_length(x_b, "pg_llm_dropout_backward");
+    (void) float_length(y_b, "pg_llm_dropout_backward");
+    (void) float_length(dy_b, "pg_llm_dropout_backward");
+
+    out = bytea_same_size(x_b);
+    x = as_float(x_b);
+    y = as_float(y_b);
+    dy = as_float(dy_b);
+    dx = as_float(out);
+
+    if (!training || p == 0.0f || n == 0) {
+        memcpy(dx, dy, n * sizeof(float));
+        PG_RETURN_BYTEA_P(out);
+    }
+
+    const float scale = 1.0f / (1.0f - p);
+
+    for (int i = 0; i < n; ++i) {
+        if (y[i] != 0.0f || x[i] == 0.0f)
+            dx[i] = dy[i] * scale;
+        else
+            dx[i] = 0.0f;
+    }
+
+    PG_RETURN_BYTEA_P(out);
+}
+
+/* ----------------------------------------------------------
  *  LayerNorm backward
  * ---------------------------------------------------------- */
-PG_FUNCTION_INFO_V1(pg_llm_layernorm_backward);
-Datum pg_llm_layernorm_backward(PG_FUNCTION_ARGS)
+Datum
+pg_llm_layernorm_backward(PG_FUNCTION_ARGS)
 {
     bytea *x_b  = PG_GETARG_BYTEA_P(0);
     bytea *dy_b = PG_GETARG_BYTEA_P(1);

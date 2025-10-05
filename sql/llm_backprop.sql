@@ -39,6 +39,17 @@ BEGIN
           (SELECT grad FROM llm_tensor_rt WHERE id=node.output))
       WHERE id = node.inputs[1];
 
+        ELSIF node.name='dropout' THEN
+            UPDATE llm_tensor_rt
+              SET grad = COALESCE(grad, pg_llm_zeros_like(data))
+                        + pg_llm_dropout_backward(
+                            (SELECT data FROM llm_tensor_rt WHERE id=node.inputs[1]),
+                            (SELECT data FROM llm_tensor_rt WHERE id=node.output),
+                            (SELECT grad FROM llm_tensor_rt WHERE id=node.output),
+                            COALESCE((node.extra->>'p')::FLOAT4, 0.0::FLOAT4),
+                            COALESCE((node.extra->>'training')::BOOLEAN, true))
+              WHERE id=node.inputs[1];
+
         ELSIF node.name='layernorm' THEN
             PERFORM (SELECT dx, dgamma, dbeta
              FROM pg_llm_layernorm_backward(
