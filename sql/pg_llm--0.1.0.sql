@@ -106,7 +106,14 @@ BEGIN
     x := llm_embed(tokens, model, D);   -- we'll define this below
 
     -- 2. Forward pass through transformer
-    x := llm_forward_gpt2(x, n_layer, n_head, array_length(tokens,1), D);
+    x := llm_forward_gpt2(
+        x,
+        n_layer,
+        n_head,
+        array_length(tokens,1),
+        D,
+        (SELECT data FROM llm_param p WHERE p.model = model AND p.name = 'ln_f.weight'),
+        (SELECT data FROM llm_param p WHERE p.model = model AND p.name = 'ln_f.bias'));
 
     -- 3. Final linear projection (tie weights with token_emb)
     logits := pg_llm_matmul(x,
