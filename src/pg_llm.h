@@ -25,6 +25,12 @@ extern Datum pg_llm_softmax_backward(PG_FUNCTION_ARGS);
 extern Datum pg_llm_layernorm_backward(PG_FUNCTION_ARGS);
 extern Datum pg_llm_dropout_backward(PG_FUNCTION_ARGS);
 
+/* Autograd instrumentation helpers */
+extern bool pg_llm_autograd_enabled(void);
+extern int pg_llm_autograd_track_tensor(bytea *tensor, int ndims, const int *dims, bool requires_grad);
+extern void pg_llm_autograd_record_tape(const char *name, int *inputs, int n_inputs, int output, const char *extra_json);
+extern void pg_llm_autograd_map_param(const char *model, const char *name, int token_id, bytea *tensor, int ndims, const int *dims);
+
 /* Optimized kernels */
 extern void pg_llm_fast_gemm(const float *A, const float *B, float *C,
                              int M, int K, int N);

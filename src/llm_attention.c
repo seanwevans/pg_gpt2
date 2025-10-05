@@ -2,41 +2,13 @@
 
 #define PG_LLM_ATTENTION_CHUNK 64
 
-/*
- * Multi-head self-attention
- * args:
- *   x:     BYTEA (T×D)
- *   w_qkv: BYTEA (D×3D)
- *   b_qkv: BYTEA (3D)
- *   w_o:   BYTEA (D×D)
- *   b_o:   BYTEA (D)
- *   n_head: INT
- * returns: BYTEA (T×D)
- */
-PG_FUNCTION_INFO_V1(pg_llm_attention);
-Datum pg_llm_attention(PG_FUNCTION_ARGS)
+static void
+attention_compute(float *x, float *w_qkv, float *b_qkv,
+                  float *w_o, float *b_o,
+                  int n_head, int64_t T, int64_t D, float *Y)
 {
-    bytea *x_b    = PG_GETARG_BYTEA_P(0);
-    bytea *w_qkvb = PG_GETARG_BYTEA_P(1);
-    bytea *b_qkvb = PG_GETARG_BYTEA_P(2);
-    bytea *w_ob   = PG_GETARG_BYTEA_P(3);
-    bytea *b_ob   = PG_GETARG_BYTEA_P(4);
-    int n_head    = PG_GETARG_INT32(5);
-
-    const int64_t T = PG_GETARG_INT32(6);  /* sequence length */
-    const int64_t D = PG_GETARG_INT32(7);  /* model dim */
-
-    float *x    = as_float(x_b);
-    float *w_qkv= as_float(w_qkvb);
-    float *w_o  = as_float(w_ob);
-    float *b_qkv= as_float(b_qkvb);
-    float *b_o  = as_float(b_ob);
-
-    /* allocate temporary buffers */
     const int head_dim = D / n_head;
     const float scale = 1.0f / sqrtf((float)head_dim);
-    bytea *out;
-    float *Y;
     float *qkv;
     float *Q;
     float *K;
@@ -47,11 +19,6 @@ Datum pg_llm_attention(PG_FUNCTION_ARGS)
     float *proj;
     const int chunk_rows = Min(PG_LLM_ATTENTION_CHUNK, (int)T);
 
-    out = (bytea*) palloc(T*D*sizeof(float) + VARHDRSZ);
-    SET_VARSIZE(out, T*D*sizeof(float) + VARHDRSZ);
-    Y = as_float(out);
-
-    /* 1. Compute Q,K,V using the optimized GEMM */
     qkv = (float *) palloc((Size)T * 3 * D * sizeof(float));
     pg_llm_fast_gemm(x, w_qkv, qkv, T, D, 3 * D);
     for (int t = 0; t < T; ++t) {
@@ -67,7 +34,6 @@ Datum pg_llm_attention(PG_FUNCTION_ARGS)
     score_chunk = (float *) palloc((Size)chunk_rows * T * sizeof(float));
     context_chunk = (float *) palloc((Size)chunk_rows * head_dim * sizeof(float));
 
-    /* 2. Iterate heads with chunked GEMMs to limit peak memory */
     for (int h = 0; h < n_head; ++h) {
         int off = h * head_dim;
         float *K_head_T = (float *) palloc((Size)head_dim * T * sizeof(float));
@@ -86,8 +52,8 @@ Datum pg_llm_attention(PG_FUNCTION_ARGS)
             int rows = Min(chunk_rows, (int)T - base);
 
             for (int r = 0; r < rows; ++r) {
-                const float *src = Q + (Size)(base + r) * D + off;
-                memcpy(Q_chunk + (Size)r * head_dim, src, head_dim * sizeof(float));
+                const float *src_row = Q + (Size)(base + r) * D + off;
+                memcpy(Q_chunk + (Size)r * head_dim, src_row, head_dim * sizeof(float));
             }
 
             pg_llm_fast_gemm(Q_chunk, K_head_T, score_chunk, rows, head_dim, T);
@@ -133,7 +99,6 @@ Datum pg_llm_attention(PG_FUNCTION_ARGS)
         pfree(V_head);
     }
 
-    /* 3. project output: Y = Y @ W_o */
     proj = (float *) palloc((Size)T * D * sizeof(float));
     pg_llm_fast_gemm(Y, w_o, proj, T, D, D);
     for (int t = 0; t < T; ++t) {
@@ -148,5 +113,83 @@ Datum pg_llm_attention(PG_FUNCTION_ARGS)
     pfree(score_chunk);
     pfree(Q_chunk);
     pfree(qkv);
+}
+
+/*
+ * Multi-head self-attention
+ * args:
+ *   x:     BYTEA (T×D)
+ *   w_qkv: BYTEA (D×3D)
+ *   b_qkv: BYTEA (3D)
+ *   w_o:   BYTEA (D×D)
+ *   b_o:   BYTEA (D)
+ *   n_head: INT
+ * returns: BYTEA (T×D)
+ */
+PG_FUNCTION_INFO_V1(pg_llm_attention);
+Datum pg_llm_attention(PG_FUNCTION_ARGS)
+{
+    bytea *x_b    = PG_GETARG_BYTEA_P(0);
+    bytea *w_qkvb = PG_GETARG_BYTEA_P(1);
+    bytea *b_qkvb = PG_GETARG_BYTEA_P(2);
+    bytea *w_ob   = PG_GETARG_BYTEA_P(3);
+    bytea *b_ob   = PG_GETARG_BYTEA_P(4);
+    int n_head    = PG_GETARG_INT32(5);
+
+    const int64_t T = PG_GETARG_INT32(6);  /* sequence length */
+    const int64_t D = PG_GETARG_INT32(7);  /* model dim */
+
+    float *x    = as_float(x_b);
+    float *w_qkv= as_float(w_qkvb);
+    float *w_o  = as_float(w_ob);
+    float *b_qkv= as_float(b_qkvb);
+    float *b_o  = as_float(b_ob);
+    bool autograd = pg_llm_autograd_enabled();
+    int input_ids[5];
+
+    bytea *out = (bytea*) palloc(T*D*sizeof(float) + VARHDRSZ);
+    SET_VARSIZE(out, T*D*sizeof(float) + VARHDRSZ);
+    float *Y = as_float(out);
+
+    if (autograd)
+    {
+        if (SPI_connect() != SPI_OK_CONNECT)
+            ereport(ERROR, (errmsg("SPI_connect failed in pg_llm_attention")));
+
+        PG_TRY();
+        {
+            int dims_x[2] = {(int)T, (int)D};
+            int dims_wqkv[2] = {(int)D, (int)(3 * D)};
+            int dims_bqkv[1] = {(int)(3 * D)};
+            int dims_wo[2] = {(int)D, (int)D};
+            int dims_bo[1] = {(int)D};
+            input_ids[0] = pg_llm_autograd_track_tensor(x_b, 2, dims_x, true);
+            input_ids[1] = pg_llm_autograd_track_tensor(w_qkvb, 2, dims_wqkv, true);
+            input_ids[2] = pg_llm_autograd_track_tensor(b_qkvb, 1, dims_bqkv, true);
+            input_ids[3] = pg_llm_autograd_track_tensor(w_ob, 2, dims_wo, true);
+            input_ids[4] = pg_llm_autograd_track_tensor(b_ob, 1, dims_bo, true);
+
+            attention_compute(x, w_qkv, b_qkv, w_o, b_o, n_head, T, D, Y);
+
+            int dims_out[2] = {(int)T, (int)D};
+            int output_id = pg_llm_autograd_track_tensor(out, 2, dims_out, true);
+            char *extra = psprintf("{\"n_head\":%d,\"T\":%d,\"D\":%d}",
+                                    n_head, (int)T, (int)D);
+            pg_llm_autograd_record_tape("attention", input_ids, 5, output_id, extra);
+        }
+        PG_CATCH();
+        {
+            SPI_finish();
+            PG_RE_THROW();
+        }
+        PG_END_TRY();
+
+        SPI_finish();
+    }
+    else
+    {
+        attention_compute(x, w_qkv, b_qkv, w_o, b_o, n_head, T, D, Y);
+    }
+
     PG_RETURN_BYTEA_P(out);
 }
