@@ -124,6 +124,44 @@ SELECT llm_encode('Hello world!','gpt2-small');
 SELECT llm_decode(ARRAY[15496,2159,0],'gpt2-small');
 ```
 
+### Utility Scripts
+
+The repository includes Python helpers for preparing external assets before
+calling the SQL functions above. All scripts live under `scripts/`.
+
+| Script | Purpose |
+|--------|---------|
+| `convert_gpt2_checkpoint.py` | Download/convert a HuggingFace GPT-2 checkpoint into the gzip-based `.npz` container expected by `pg_llm_import_npz`. |
+| `ingest_tokenizer.py` | Load `vocab.json` and `merges.txt` tokenizer assets into `llm_bpe_vocab`/`llm_bpe_merges` using a PostgreSQL connection. |
+| `prepare_dataset.py` | Tokenize raw text files with the GPT-2 tokenizer and populate `llm_dataset` with fixed-length `(tokens, target)` arrays. |
+
+Install the optional Python dependencies with:
+
+```
+pip install transformers torch psycopg[binary]
+```
+
+Examples:
+
+```
+# 1. Convert HuggingFace weights to /mnt/models/gpt2-small.npz
+python scripts/convert_gpt2_checkpoint.py --source gpt2 --output /mnt/models/gpt2-small.npz
+
+# 2. Load tokenizer assets into PostgreSQL
+python scripts/ingest_tokenizer.py \
+  --dsn postgresql://postgres@localhost:5432/postgres \
+  --model gpt2-small \
+  --vocab /mnt/gpt2/vocab.json \
+  --merges /mnt/gpt2/merges.txt --truncate
+
+# 3. Tokenize a corpus and fill llm_dataset
+python scripts/prepare_dataset.py \
+  --dsn postgresql://postgres@localhost:5432/postgres \
+  --tokenizer gpt2 \
+  --input /mnt/corpus/*.txt \
+  --block-size 1024 --truncate
+```
+
 ---
 
 ## Mathematical Fidelity
