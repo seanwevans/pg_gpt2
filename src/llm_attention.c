@@ -3,9 +3,11 @@
 /*
  * Multi-head self-attention
  * args:
- *   x:    BYTEA (T×D)
+ *   x:     BYTEA (T×D)
  *   w_qkv: BYTEA (D×3D)
+ *   b_qkv: BYTEA (3D)
  *   w_o:   BYTEA (D×D)
+ *   b_o:   BYTEA (D)
  *   n_head: INT
  * returns: BYTEA (T×D)
  */
@@ -14,15 +16,19 @@ Datum pg_llm_attention(PG_FUNCTION_ARGS)
 {
     bytea *x_b    = PG_GETARG_BYTEA_P(0);
     bytea *w_qkvb = PG_GETARG_BYTEA_P(1);
-    bytea *w_ob   = PG_GETARG_BYTEA_P(2);
-    int n_head    = PG_GETARG_INT32(3);
+    bytea *b_qkvb = PG_GETARG_BYTEA_P(2);
+    bytea *w_ob   = PG_GETARG_BYTEA_P(3);
+    bytea *b_ob   = PG_GETARG_BYTEA_P(4);
+    int n_head    = PG_GETARG_INT32(5);
 
-    const int64_t T = PG_GETARG_INT32(4);  /* sequence length */
-    const int64_t D = PG_GETARG_INT32(5);  /* model dim */
+    const int64_t T = PG_GETARG_INT32(6);  /* sequence length */
+    const int64_t D = PG_GETARG_INT32(7);  /* model dim */
 
     float *x    = as_float(x_b);
     float *w_qkv= as_float(w_qkvb);
     float *w_o  = as_float(w_ob);
+    float *b_qkv= as_float(b_qkvb);
+    float *b_o  = as_float(b_ob);
 
     /* allocate temporary buffers */
     const int head_dim = D / n_head;
@@ -48,11 +54,11 @@ Datum pg_llm_attention(PG_FUNCTION_ARGS)
             for (int k=0; k<D; ++k)
                 s += x[t*D + k] * w_qkv[k*3*D + j];
             if (j < D)
-                Q[t*D + j] = s;
+                Q[t*D + j] = s + b_qkv[j];
             else if (j < 2*D)
-                K[t*D + (j - D)] = s;
+                K[t*D + (j - D)] = s + b_qkv[j];
             else
-                V[t*D + (j - 2*D)] = s;
+                V[t*D + (j - 2*D)] = s + b_qkv[j];
         }
     }
 
@@ -98,7 +104,7 @@ Datum pg_llm_attention(PG_FUNCTION_ARGS)
             float s = 0;
             for (int k=0;k<D;++k)
                 s += Y[i*D + k]*w_o[k*D + j];
-            tmp[i*D + j]=s;
+            tmp[i*D + j]=s + b_o[j];
         }
     }
     memcpy(Y,tmp,T*D*sizeof(float));
