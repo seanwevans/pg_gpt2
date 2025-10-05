@@ -193,7 +193,8 @@ CREATE OR REPLACE FUNCTION llm_train_step(
     wd FLOAT4,
     lr_max FLOAT4,
     warmup INT,
-    total_steps INT)
+    total_steps INT,
+    grad_clip FLOAT4 DEFAULT NULL)
 RETURNS FLOAT4 AS $$
 DECLARE
     seq INT[];
@@ -242,7 +243,12 @@ BEGIN
     SET (data, m, v, grad, step) = (
         SELECT s.weight, s.m, s.v, NULL::BYTEA, step_count
         FROM pg_llm_adamw_step(
-            data, grad, m, v,
+            data,
+            CASE
+                WHEN grad IS NULL OR grad_clip IS NULL OR grad_clip <= 0 THEN grad
+                ELSE pg_llm_grad_clip(grad, grad_clip)
+            END,
+            m, v,
             lr, beta1, beta2, eps, wd, step_count
         ) AS s
     )
@@ -308,7 +314,8 @@ CREATE OR REPLACE FUNCTION llm_train(
     eps FLOAT4 DEFAULT 1e-8,
     wd FLOAT4 DEFAULT 0.01,
     lr_max FLOAT4 DEFAULT 2.5e-4,
-    warmup INT DEFAULT 2000)
+    warmup INT DEFAULT 2000,
+    grad_clip FLOAT4 DEFAULT NULL)
 RETURNS VOID AS $$
 DECLARE
     loss FLOAT4;
@@ -342,7 +349,8 @@ BEGIN
             n_layer, n_head, D, vocab,
             dropout_p,
             beta1, beta2, eps, wd,
-            lr_max, warmup, n_steps);
+            lr_max, warmup, n_steps,
+            grad_clip);
 
         RAISE NOTICE 'step %/% loss=%', i, n_steps, loss;
     END LOOP;
