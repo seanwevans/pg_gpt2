@@ -13,6 +13,15 @@ REGRESS = adamw
 
 PG_CPPFLAGS += -I$(srcdir)/src
 
-PG_CONFIG = pg_config
-PGXS := $(shell $(PG_CONFIG) --pgxs)
+PG_CONFIG ?= pg_config
+PGXS := $(shell $(PG_CONFIG) --pgxs 2>/dev/null)
+
+ifeq ($(strip $(PGXS)),)
+$(error Could not run pg_config via '$(PG_CONFIG)'. Install the PostgreSQL server development package or set PG_CONFIG.)
+endif
+
+ifeq (,$(wildcard $(PGXS)))
+$(error PostgreSQL PGXS makefile not found at $(PGXS). Install the server development package (e.g. postgresql-server-dev-16) to build this extension.)
+endif
+
 include $(PGXS)
