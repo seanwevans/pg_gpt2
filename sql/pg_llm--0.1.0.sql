@@ -85,7 +85,11 @@ CREATE TABLE llm_train_log (
 CREATE UNLOGGED TABLE llm_dataset (
     id SERIAL PRIMARY KEY,
     tokens INT[],          -- 1024-token sequence
-    target INT[]           -- shifted targets
+    target INT[],          -- shifted targets
+    CHECK (array_length(tokens, 1) IS NULL OR array_length(tokens, 1) <= 1024),
+    CHECK (array_length(target, 1) IS NULL OR array_length(target, 1) <= 1024),
+    CHECK ((array_length(tokens, 1) IS NULL AND array_length(target, 1) IS NULL)
+           OR array_length(tokens, 1) = array_length(target, 1))
 );
 
 CREATE OR REPLACE FUNCTION llm_loss(
@@ -177,18 +181,38 @@ CREATE OR REPLACE FUNCTION llm_embed(tokens INT[], model TEXT, D INT)
 RETURNS BYTEA AS $$
 DECLARE
     out BYTEA;
+    seq_len INT;
 BEGIN
-    -- Flatten token embeddings
-    SELECT string_agg(p.data::TEXT, '' ORDER BY t.ord)::BYTEA INTO out
-    FROM unnest(tokens) WITH ORDINALITY AS t(token_id, ord)
-    JOIN llm_param p
-      ON p.model = model
-     AND p.name = 'wte'
-     AND p.token_id = t.token_id;
+    seq_len := COALESCE(array_length(tokens, 1), 0);
+
+    IF seq_len = 0 THEN
+        RETURN ''::BYTEA;
+    END IF;
+
+    IF seq_len > 1024 THEN
+        RAISE EXCEPTION 'Sequence length % exceeds GPT-2 maximum of 1024 positions', seq_len;
+    END IF;
+
+    -- Flatten summed token and positional embeddings
+    SELECT string_agg(
+               pg_llm_add(wte.data, wpe.data)::TEXT,
+               '' ORDER BY t.ord
+           )::BYTEA
+      INTO out
+      FROM unnest(tokens) WITH ORDINALITY AS t(token_id, ord)
+      JOIN llm_param wte
+        ON wte.model = model
+       AND wte.name = 'wte'
+       AND wte.token_id = t.token_id
+      JOIN llm_param wpe
+        ON wpe.model = model
+       AND wpe.name = 'wpe'
+       AND wpe.token_id = t.ord - 1;
 
     IF out IS NULL THEN
-        RAISE EXCEPTION 'Missing embeddings for one or more tokens in model %', model;
+        RAISE EXCEPTION 'Missing token or positional embeddings for model %', model;
     END IF;
+
     RETURN out;
 END;
 $$ LANGUAGE plpgsql;
