@@ -25,25 +25,41 @@ Datum pg_llm_adamw_step(PG_FUNCTION_ARGS)
     int    t    = PG_GETARG_INT32(9);
 
     int n = (int)(nbytes(w_b) / sizeof(float));
+    bytea *w_out;
+    bytea *m_out;
+    bytea *v_out;
+    float *w;
+    float *g;
+    float *m;
+    float *v;
+    float *wo;
+    float *mo;
+    float *vo;
+    float bc1;
+    float bc2;
+    TupleDesc tupdesc;
+    Datum values[3];
+    bool nulls[3] = {false,false,false};
+    HeapTuple rettuple;
 
-    bytea *w_out = (bytea*) palloc(n*sizeof(float) + VARHDRSZ);
-    bytea *m_out = (bytea*) palloc(n*sizeof(float) + VARHDRSZ);
-    bytea *v_out = (bytea*) palloc(n*sizeof(float) + VARHDRSZ);
+    w_out = (bytea*) palloc(n*sizeof(float) + VARHDRSZ);
+    m_out = (bytea*) palloc(n*sizeof(float) + VARHDRSZ);
+    v_out = (bytea*) palloc(n*sizeof(float) + VARHDRSZ);
     SET_VARSIZE(w_out, n*sizeof(float) + VARHDRSZ);
     SET_VARSIZE(m_out, n*sizeof(float) + VARHDRSZ);
     SET_VARSIZE(v_out, n*sizeof(float) + VARHDRSZ);
 
-    float *w = as_float(w_b);
-    float *g = as_float(g_b);
-    float *m = as_float(m_b);
-    float *v = as_float(v_b);
-    float *wo= as_float(w_out);
-    float *mo= as_float(m_out);
-    float *vo= as_float(v_out);
+    w = as_float(w_b);
+    g = as_float(g_b);
+    m = as_float(m_b);
+    v = as_float(v_b);
+    wo= as_float(w_out);
+    mo= as_float(m_out);
+    vo= as_float(v_out);
 
     /* bias-correction */
-    float bc1 = 1.0f - powf(b1, t);
-    float bc2 = 1.0f - powf(b2, t);
+    bc1 = 1.0f - powf(b1, t);
+    bc2 = 1.0f - powf(b2, t);
 
     /* Follow AdamW (Loshchilov & Hutter, 2019) with decoupled weight decay. */
     for (int i=0;i<n;++i) {
@@ -58,10 +74,6 @@ Datum pg_llm_adamw_step(PG_FUNCTION_ARGS)
         vo[i] = v_t;
     }
 
-    TupleDesc tupdesc;
-    Datum values[3];
-    bool nulls[3] = {false,false,false};
-
     if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
         ereport(ERROR, (errmsg("expected composite return type")));
 
@@ -70,7 +82,7 @@ Datum pg_llm_adamw_step(PG_FUNCTION_ARGS)
     values[1] = PointerGetDatum(m_out);
     values[2] = PointerGetDatum(v_out);
 
-    HeapTuple rettuple = heap_form_tuple(tupdesc, values, nulls);
+    rettuple = heap_form_tuple(tupdesc, values, nulls);
     PG_RETURN_DATUM(HeapTupleGetDatum(rettuple));
 }
 
@@ -84,15 +96,18 @@ Datum pg_llm_grad_clip(PG_FUNCTION_ARGS)
     float  clip = PG_GETARG_FLOAT4(1);
     int n = (int)(nbytes(g_b)/sizeof(float));
     float *g = as_float(g_b);
-
     float norm=0;
+    float scale;
+    bytea *out;
+    float *go;
+
     for(int i=0;i<n;++i) norm += g[i]*g[i];
     norm = sqrtf(norm);
-    float scale = (norm>clip)? (clip/norm) : 1.0f;
+    scale = (norm>clip)? (clip/norm) : 1.0f;
 
-    bytea *out = (bytea*) palloc(n*sizeof(float)+VARHDRSZ);
+    out = (bytea*) palloc(n*sizeof(float)+VARHDRSZ);
     SET_VARSIZE(out, n*sizeof(float)+VARHDRSZ);
-    float *go = as_float(out);
+    go = as_float(out);
     for(int i=0;i<n;++i) go[i] = g[i]*scale;
 
     PG_RETURN_BYTEA_P(out);

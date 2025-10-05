@@ -25,17 +25,23 @@ Datum pg_llm_attention(PG_FUNCTION_ARGS)
     float *w_o  = as_float(w_ob);
 
     /* allocate temporary buffers */
-    bytea *out = (bytea*) palloc(T*D*sizeof(float) + VARHDRSZ);
-    SET_VARSIZE(out, T*D*sizeof(float) + VARHDRSZ);
-    float *Y = as_float(out);
-
     const int head_dim = D / n_head;
     const float scale = 1.0f / sqrtf((float)head_dim);
+    bytea *out;
+    float *Y;
+    float *Q;
+    float *K;
+    float *V;
+    float *tmp;
+
+    out = (bytea*) palloc(T*D*sizeof(float) + VARHDRSZ);
+    SET_VARSIZE(out, T*D*sizeof(float) + VARHDRSZ);
+    Y = as_float(out);
 
     /* 1. Q,K,V = x @ W_qkv, then split */
-    float *Q = palloc(T * D * sizeof(float));
-    float *K = palloc(T * D * sizeof(float));
-    float *V = palloc(T * D * sizeof(float));
+    Q = palloc(T * D * sizeof(float));
+    K = palloc(T * D * sizeof(float));
+    V = palloc(T * D * sizeof(float));
     for (int t=0; t<T; ++t) {
         for (int j=0; j<3*D; ++j) {
             float s = 0.0f;
@@ -58,9 +64,10 @@ Datum pg_llm_attention(PG_FUNCTION_ARGS)
             int q_base = i*D + off;
             float scores[1024]; /* max ctx len = 1024 */
             float maxs = -1e9f;
+            float sum;
             for (int j=0;j<=i;++j){          /* causal mask */
                 int k_base = j*D + off;
-                float dot=0;
+                float dot = 0;
                 for(int d=0;d<head_dim;++d)
                     dot += Q[q_base + d]*K[k_base + d];
                 dot *= scale;
@@ -68,7 +75,7 @@ Datum pg_llm_attention(PG_FUNCTION_ARGS)
                 if(dot>maxs)maxs=dot;
             }
             /* softmax */
-            float sum=0;
+            sum = 0;
             for(int j=0;j<=i;++j){ scores[j]=expf(scores[j]-maxs); sum+=scores[j]; }
             for(int j=0;j<=i;++j) scores[j]/=sum;
 
@@ -85,14 +92,15 @@ Datum pg_llm_attention(PG_FUNCTION_ARGS)
     }
 
     /* 3. project output: Y = Y @ W_o */
-    float *tmp = palloc(T * D * sizeof(float));
-    for (int i=0; i<T; ++i)
-      for (int j=0; j<D; ++j){
-          float s=0;
-          for (int k=0;k<D;++k)
-              s += Y[i*D + k]*w_o[k*D + j];
-          tmp[i*D + j]=s;
-      }
+    tmp = palloc(T * D * sizeof(float));
+    for (int i=0; i<T; ++i) {
+        for (int j=0; j<D; ++j){
+            float s = 0;
+            for (int k=0;k<D;++k)
+                s += Y[i*D + k]*w_o[k*D + j];
+            tmp[i*D + j]=s;
+        }
+    }
     memcpy(Y,tmp,T*D*sizeof(float));
     pfree(tmp);
     pfree(Q);

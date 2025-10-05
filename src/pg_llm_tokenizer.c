@@ -10,19 +10,25 @@ Datum pg_llm_load_bpe_vocab(PG_FUNCTION_ARGS)
     char *model = text_to_cstring(model_t);
 
     FILE *f = fopen(path,"r");
+    StringInfoData q;
+    char token[512];
+    int id;
+    Oid types[2];
+    Datum vals[2];
+
     if(!f) ereport(ERROR,(errmsg("cannot open %s",path)));
     SPI_connect();
-    StringInfoData q; initStringInfo(&q);
+    initStringInfo(&q);
 
-    char token[512]; int id;
     while(fscanf(f," \"%[^\"]\" : %d,",token,&id)==2){
         resetStringInfo(&q);
         appendStringInfo(&q,
             "INSERT INTO llm_bpe_vocab(model,token_id,token,bytes)"
             "VALUES('%s',%d,$1,$2) ON CONFLICT DO NOTHING;",model,id);
-        Oid types[2]={TEXTOID,BYTEAOID};
-        Datum vals[2]={CStringGetTextDatum(token),
-                       PointerGetDatum(cstring_to_text(token))};
+        types[0]=TEXTOID;
+        types[1]=BYTEAOID;
+        vals[0]=CStringGetTextDatum(token);
+        vals[1]=PointerGetDatum(cstring_to_text(token));
         SPI_execute_with_args(q.data,2,types,vals,NULL,false,0);
     }
     fclose(f);
@@ -39,11 +45,15 @@ Datum pg_llm_load_bpe_merges(PG_FUNCTION_ARGS)
     char *model=text_to_cstring(model_t);
 
     FILE *f=fopen(path,"r");
+    char l[256], r[256];
+    int rank=0;
+
     if(!f) ereport(ERROR,(errmsg("cannot open %s",path)));
     SPI_connect();
-    char l[256], r[256]; int rank=0;
     while(fscanf(f,"%255s %255s",l,r)==2){
-        StringInfoData q; initStringInfo(&q);
+        StringInfoData q;
+
+        initStringInfo(&q);
         appendStringInfo(&q,
             "INSERT INTO llm_bpe_merges(model,rank,left,right,pair)"
             "VALUES('%s',%d,'%s','%s','%s %s')",
