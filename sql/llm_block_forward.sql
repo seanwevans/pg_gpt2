@@ -1,7 +1,9 @@
 CREATE OR REPLACE FUNCTION llm_block_forward(
     input BYTEA,
     w_qkv BYTEA,
+    b_qkv BYTEA,
     w_o BYTEA,
+    b_o BYTEA,
     w_fc BYTEA,
     w_proj BYTEA,
     ln1_g BYTEA,
@@ -22,7 +24,7 @@ BEGIN
     x := pg_llm_layernorm(x, ln1_g, ln1_b, eps);
 
     -- 2. Self-Attention
-    attn := pg_llm_attention(x, w_qkv, w_o, n_head, T, D);
+    attn := pg_llm_attention(x, w_qkv, b_qkv, w_o, b_o, n_head, T, D);
     x := pg_llm_add(input, attn);  -- residual 1
 
     -- 3. LayerNorm
@@ -47,7 +49,9 @@ BEGIN
         x := llm_block_forward(
             x,
             (SELECT data FROM llm_tensor WHERE name = format('h.%s.attn.c_attn.weight', i)),
+            (SELECT data FROM llm_tensor WHERE name = format('h.%s.attn.c_attn.bias', i)),
             (SELECT data FROM llm_tensor WHERE name = format('h.%s.attn.c_proj.weight', i)),
+            (SELECT data FROM llm_tensor WHERE name = format('h.%s.attn.c_proj.bias', i)),
             (SELECT data FROM llm_tensor WHERE name = format('h.%s.mlp.c_fc.weight', i)),
             (SELECT data FROM llm_tensor WHERE name = format('h.%s.mlp.c_proj.weight', i)),
             (SELECT data FROM llm_tensor WHERE name = format('h.%s.ln_1.weight', i)),
