@@ -228,9 +228,10 @@ SELECT llm_checkpoint_save('gpt2-small','finetuned on corpus X');
 ## Performance Notes
 
 - All tensors are stored as raw `BYTEA` blobs and processed in-memory.
-- CPU backend uses simple C loops; BLAS or SIMD integration (e.g. OpenBLAS, libxsimd) is optional.
-- For large models, Postgres memory limits and `work_mem` should be increased.
-- `UNLOGGED` tables are used for intermediate activations to minimize I/O overhead.
+- Core kernels (`pg_llm_matmul`, attention) use a tiled AVX2-aware micro-kernel that falls back to scalar math when SIMD is unavailable, delivering BLAS-class throughput without external dependencies.
+- Attention is evaluated in configurable row chunks (default 64 tokens) so that context matrices never exceed a manageable working set, enabling GPT-2 scale sequence lengths inside Postgres.
+- For large models, raise `work_mem`/`maintenance_work_mem` and consider chunking your training data via windowed queries so each step fits inside the executor's memory context.
+- Store activations and optimizer scratch data in `UNLOGGED` tables (e.g., `CREATE UNLOGGED TABLE llm_activations (...)`) to avoid WAL amplification when materializing large tensors.
 - Autograd tape pruning and gradient accumulation can be parallelized safely within a transaction.
 
 ---

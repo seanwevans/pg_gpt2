@@ -22,6 +22,10 @@ extern Datum pg_llm_softmax_backward(PG_FUNCTION_ARGS);
 extern Datum pg_llm_layernorm_backward(PG_FUNCTION_ARGS);
 extern Datum pg_llm_dropout_backward(PG_FUNCTION_ARGS);
 
+/* Optimized kernels */
+extern void pg_llm_fast_gemm(const float *A, const float *B, float *C,
+                             int M, int K, int N);
+
 /* Utility helpers */
 static inline float* as_float(bytea *b) {
     return (float*) VARDATA_ANY(b);
