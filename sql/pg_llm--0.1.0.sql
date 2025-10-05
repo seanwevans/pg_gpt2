@@ -466,30 +466,6 @@ RETURNS void
 AS 'MODULE_PATHNAME', 'pg_llm_import_npz'
 LANGUAGE C STRICT;
 
-PG_FUNCTION_INFO_V1(pg_llm_export_npz);
-Datum pg_llm_export_npz(PG_FUNCTION_ARGS)
-{
-    text *path_t = PG_GETARG_TEXT_P(0);
-    text *model_t= PG_GETARG_TEXT_P(1);
-    char *path=text_to_cstring(path_t);
-    char *model=text_to_cstring(model_t);
-
-    SPI_connect();
-    gzFile fp=gzopen(path,"wb");
-    if(!fp) ereport(ERROR,(errmsg("cannot open %s",path)));
-
-    SPI_execute("SELECT name,data FROM llm_param WHERE model=$1",true,0);
-
-    for(uint64 i=0;i<SPI_processed;++i){
-        HeapTuple t=SPI_tuptable->vals[i];
-        char *name=TextDatumGetCString(SPI_getbinval(t,SPI_tuptable->tupdesc,1,NULL));
-        bytea *b=(bytea*)DatumGetPointer(SPI_getbinval(t,SPI_tuptable->tupdesc,2,NULL));
-        write_npz_entry(fp,name,(float*)VARDATA_ANY(b),VARHDRSZ, nbytes(b)/sizeof(float));
-    }
-    gzclose(fp);
-    SPI_finish();
-    PG_RETURN_VOID();
-}
 CREATE FUNCTION pg_llm_export_npz(path TEXT, model TEXT)
 RETURNS void
 AS 'MODULE_PATHNAME', 'pg_llm_export_npz'

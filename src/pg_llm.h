@@ -24,6 +24,7 @@ extern Datum pg_llm_gelu_backward(PG_FUNCTION_ARGS);
 extern Datum pg_llm_softmax_backward(PG_FUNCTION_ARGS);
 extern Datum pg_llm_layernorm_backward(PG_FUNCTION_ARGS);
 extern Datum pg_llm_dropout_backward(PG_FUNCTION_ARGS);
+extern Datum pg_llm_export_npz(PG_FUNCTION_ARGS);
 extern Datum pg_llm_cross_entropy_backward(PG_FUNCTION_ARGS);
 
 /* Optimized kernels */
