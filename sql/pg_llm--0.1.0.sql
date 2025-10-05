@@ -296,6 +296,10 @@ BEGIN
     INSERT INTO llm_train_log(model, step, lr, loss)
     VALUES(model, step_count, lr, loss);
 
+    -- Free runtime autograd state eagerly so the next step starts clean
+    DELETE FROM llm_tape;
+    DELETE FROM llm_tensor_rt;
+
     RETURN loss;
 END;
 $$ LANGUAGE plpgsql;
