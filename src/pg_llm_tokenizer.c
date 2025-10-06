@@ -1,5 +1,6 @@
 #include "pg_llm.h"
 #include "executor/spi.h"
+#include "lib/stringinfo.h"
 #include <string.h>
 
 PG_FUNCTION_INFO_V1(pg_llm_load_bpe_vocab);
@@ -11,55 +12,71 @@ Datum pg_llm_load_bpe_vocab(PG_FUNCTION_ARGS)
     char *model = text_to_cstring(model_t);
 
     FILE *f = fopen(path, "r");
-    char token[512];
-    int id;
+    StringInfoData buf;
+    char chunk[8192];
+    size_t nread;
     const char *query =
-        "INSERT INTO llm_bpe_vocab(model,token_id,token,bytes)"
-        "VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING;";
-    Oid argtypes[4] = {TEXTOID, INT4OID, TEXTOID, BYTEAOID};
-    bool nulls[4] = {false, false, false, false};
+        "INSERT INTO llm_bpe_vocab(model,token_id,token,bytes) "
+        "SELECT $1, value::INT, key, convert_to(key, 'UTF8') "
+        "FROM json_each_text($2::json) ON CONFLICT DO NOTHING;";
+    Oid argtypes[2] = {TEXTOID, TEXTOID};
+    bool nulls[2] = {false, false};
     Datum model_datum;
+    Datum vocab_json;
 
     if (!f)
         ereport(ERROR, (errmsg("cannot open %s", path)));
 
-    SPI_connect();
+    initStringInfo(&buf);
+    while ((nread = fread(chunk, 1, sizeof(chunk), f)) > 0)
+        appendBinaryStringInfo(&buf, chunk, nread);
 
-    model_datum = CStringGetTextDatum(model);
-
-    while (fscanf(f, " \"%[^\"]\" : %d,", token, &id) == 2)
+    if (ferror(f))
     {
-        Datum values[4];
-        Datum token_text;
-        bytea *token_bytes;
-        int rc;
-
-        Size token_len = strlen(token);
-
-        token_text = CStringGetTextDatum(token);
-        token_bytes = bytea_alloc(token_len);
-        if (token_len > 0)
-            memcpy(VARDATA(token_bytes), token, token_len);
-
-        values[0] = model_datum;
-        values[1] = Int32GetDatum((int32) id);
-        values[2] = token_text;
-        values[3] = PointerGetDatum(token_bytes);
-
-        rc = SPI_execute_with_args(query, 4, argtypes, values, nulls, false, 0);
-        if (rc != SPI_OK_INSERT)
-            ereport(ERROR,
-                    (errmsg("failed to insert BPE vocab row for token %d (SPI code %d)",
-                            id, rc)));
-
-        pfree(DatumGetPointer(token_text));
-        pfree(token_bytes);
+        fclose(f);
+        pfree(buf.data);
+        ereport(ERROR, (errmsg("failed to read %s", path)));
     }
 
-    pfree(DatumGetPointer(model_datum));
-
     fclose(f);
+
+    model_datum = CStringGetTextDatum(model);
+    vocab_json = CStringGetTextDatum(buf.data);
+
+    pfree(buf.data);
+
+    if (SPI_connect() != SPI_OK_CONNECT)
+        ereport(ERROR, (errmsg("SPI_connect failed in pg_llm_load_bpe_vocab")));
+
+    PG_TRY();
+    {
+        Datum values[2];
+        int rc;
+
+        values[0] = model_datum;
+        values[1] = vocab_json;
+
+        rc = SPI_execute_with_args(query, 2, argtypes, values, nulls, false, 0);
+        if (rc != SPI_OK_INSERT)
+            ereport(ERROR,
+                    (errmsg("failed to insert BPE vocab rows (SPI code %d)",
+                            rc)));
+    }
+    PG_CATCH();
+    {
+        SPI_finish();
+        pfree(DatumGetPointer(model_datum));
+        pfree(DatumGetPointer(vocab_json));
+        pfree(path);
+        pfree(model);
+        PG_RE_THROW();
+    }
+    PG_END_TRY();
+
     SPI_finish();
+
+    pfree(DatumGetPointer(model_datum));
+    pfree(DatumGetPointer(vocab_json));
     pfree(path);
     pfree(model);
     PG_RETURN_VOID();
