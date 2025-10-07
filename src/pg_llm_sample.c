@@ -1,6 +1,7 @@
 #include "pg_llm.h"
 #include <stdlib.h>
-#include <time.h>
+
+extern Datum drandom(PG_FUNCTION_ARGS);
 
 static int
 compare_desc_float(const void *a, const void *b)
@@ -36,6 +37,8 @@ Datum pg_llm_sample(PG_FUNCTION_ARGS)
     float r;
     float c = 0;
     int chosen = n - 1;
+    FmgrInfo flinfo;
+    LOCAL_FCINFO(random_fcinfo, 0);
 
     if (temp <= 0) temp = 1.0f;
     p = palloc(n*sizeof(float));
@@ -83,8 +86,23 @@ Datum pg_llm_sample(PG_FUNCTION_ARGS)
     }
 
     /* 4. sample */
-    r = (float)rand()/(float)RAND_MAX;
+    flinfo.fn_addr = drandom;
+    flinfo.fn_oid = InvalidOid;
+    flinfo.fn_nargs = 0;
+    flinfo.fn_strict = false;
+    flinfo.fn_retset = false;
+    flinfo.fn_stats = 0;
+    flinfo.fn_extra = NULL;
+    flinfo.fn_mcxt = CurrentMemoryContext;
+    flinfo.fn_expr = NULL;
+
+    InitFunctionCallInfoData(*random_fcinfo, &flinfo, 0, InvalidOid, NULL, NULL);
+
+    random_fcinfo->isnull = false;
+    r = (float) DatumGetFloat8(FunctionCallInvoke(random_fcinfo));
     for(int i=0;i<n;++i){ c+=p[i]; if(r<=c){chosen=i;break;} }
+
+    pfree(p);
 
     PG_RETURN_INT32(chosen);
 }
