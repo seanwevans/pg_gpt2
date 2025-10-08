@@ -112,8 +112,39 @@ BEGIN
               WHERE id=node.inputs[1];
 
         ELSIF node.name='layernorm' THEN
-            ln_gamma_id := COALESCE((node.extra->>'gamma_id')::INT, node.inputs[2]);
-            ln_beta_id := COALESCE((node.extra->>'beta_id')::INT, node.inputs[3]);
+            SELECT dx, dgamma, dbeta
+              INTO ln_dx, ln_dgamma, ln_dbeta
+              FROM pg_llm_layernorm_backward(
+                  (SELECT data FROM llm_tensor_rt WHERE id=node.inputs[1]),
+                  (SELECT grad FROM llm_tensor_rt WHERE id=node.output),
+                  (SELECT data FROM llm_tensor_rt WHERE id=node.inputs[2]),
+                  (node.extra->>'eps')::FLOAT4);
+
+            UPDATE llm_tensor_rt
+              SET grad = COALESCE(grad, pg_llm_zeros_like(data)) + ln_dx
+              WHERE id = node.inputs[1];
+
+            UPDATE llm_tensor_rt
+              SET grad = COALESCE(grad, pg_llm_zeros_like(data)) + ln_dgamma
+              WHERE id = node.inputs[2];
+
+            UPDATE llm_tensor_rt
+              SET grad = COALESCE(grad, pg_llm_zeros_like(data)) + ln_dbeta
+              WHERE id = node.inputs[3];
+        ELSIF node.name='attention' THEN
+            SELECT dx, dw_qkv, db_qkv, dw_o, db_o
+              INTO dx, dw_qkv, db_qkv, dw_o, db_o
+              FROM pg_llm_attention_backward(
+                  (SELECT data FROM llm_tensor_rt WHERE id=node.inputs[1]),
+                  (SELECT data FROM llm_tensor_rt WHERE id=node.inputs[2]),
+                  (SELECT data FROM llm_tensor_rt WHERE id=node.inputs[3]),
+                  (SELECT data FROM llm_tensor_rt WHERE id=node.inputs[4]),
+                  (SELECT data FROM llm_tensor_rt WHERE id=node.inputs[5]),
+                  (SELECT grad FROM llm_tensor_rt WHERE id=node.output),
+                  (node.extra->>'n_head')::INT,
+                  (node.extra->>'T')::INT,
+                  (node.extra->>'D')::INT)
+              AS t(dx BYTEA, dw_qkv BYTEA, db_qkv BYTEA, dw_o BYTEA, db_o BYTEA);
 
             SELECT dx, dgamma, dbeta
               INTO ln_dx, ln_dgamma, ln_dbeta
