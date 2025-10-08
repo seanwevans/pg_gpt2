@@ -6,6 +6,7 @@ PG_FUNCTION_INFO_V1(pg_llm_softmax_backward);
 PG_FUNCTION_INFO_V1(pg_llm_layernorm_backward);
 PG_FUNCTION_INFO_V1(pg_llm_dropout_backward);
 PG_FUNCTION_INFO_V1(pg_llm_cross_entropy_backward);
+PG_FUNCTION_INFO_V1(pg_llm_mlp_backward);
 
 Datum
 pg_llm_gelu_backward(PG_FUNCTION_ARGS)
@@ -251,5 +252,283 @@ pg_llm_layernorm_backward(PG_FUNCTION_ARGS)
     values[1]=PointerGetDatum(dg_b);
     values[2]=PointerGetDatum(db_b);
     rettuple = heap_form_tuple(tupdesc,values,nulls);
+    PG_RETURN_DATUM(HeapTupleGetDatum(rettuple));
+}
+
+/* ----------------------------------------------------------
+ *  Feed-Forward MLP backward
+ * ---------------------------------------------------------- */
+Datum
+pg_llm_mlp_backward(PG_FUNCTION_ARGS)
+{
+    bytea *x_b = PG_GETARG_BYTEA_P(0);
+    bytea *w_fc_b = PG_GETARG_BYTEA_P(1);
+    bytea *b_fc_b = PG_GETARG_BYTEA_P(2);
+    bytea *w_proj_b = PG_GETARG_BYTEA_P(3);
+    bytea *b_proj_b = PG_GETARG_BYTEA_P(4);
+    bytea *dy_b = PG_GETARG_BYTEA_P(5);
+    int T = PG_GETARG_INT32(6);
+    int D = PG_GETARG_INT32(7);
+
+    int hidden_dim;
+    Size expected_x_bytes;
+    Size expected_w_fc_bytes;
+    Size expected_w_proj_bytes;
+    Size expected_dy_bytes;
+    Size b_fc_bytes;
+    Size b_proj_bytes;
+    bool b_fc_broadcast;
+    bool b_proj_broadcast;
+
+    float *x;
+    float *w_fc;
+    float *b_fc;
+    float *w_proj;
+    float *b_proj;
+    float *dy;
+
+    bytea *dx_b;
+    float *dx;
+    bytea *dw_fc_b;
+    float *dw_fc;
+    bytea *db_fc_b;
+    float *db_fc;
+    bytea *dw_proj_b;
+    float *dw_proj;
+    bytea *db_proj_b;
+    float *db_proj;
+
+    float *fc_pre;
+    float *fc_act;
+    float *dfc;
+
+    TupleDesc tupdesc;
+    Datum values[5];
+    bool nulls[5] = {false, false, false, false, false};
+    HeapTuple rettuple;
+    const float gelu_k = 0.79788456f;
+
+    if (T <= 0 || D <= 0)
+        ereport(ERROR,
+                (errmsg("pg_llm_mlp_backward requires positive T and D")));
+
+    hidden_dim = 4 * D;
+    expected_x_bytes = (Size) T * D * sizeof(float);
+    expected_w_fc_bytes = (Size) D * hidden_dim * sizeof(float);
+    expected_w_proj_bytes = (Size) hidden_dim * D * sizeof(float);
+    expected_dy_bytes = expected_x_bytes;
+
+    if (nbytes(x_b) != expected_x_bytes)
+        ereport(ERROR,
+                (errmsg("pg_llm_mlp_backward expected x with %zu bytes (got %zu)",
+                        expected_x_bytes, nbytes(x_b))));
+    if (nbytes(w_fc_b) != expected_w_fc_bytes)
+        ereport(ERROR,
+                (errmsg("pg_llm_mlp_backward expected w_fc with %zu bytes (got %zu)",
+                        expected_w_fc_bytes, nbytes(w_fc_b))));
+    if (nbytes(w_proj_b) != expected_w_proj_bytes)
+        ereport(ERROR,
+                (errmsg("pg_llm_mlp_backward expected w_proj with %zu bytes (got %zu)",
+                        expected_w_proj_bytes, nbytes(w_proj_b))));
+    if (nbytes(dy_b) != expected_dy_bytes)
+        ereport(ERROR,
+                (errmsg("pg_llm_mlp_backward expected dy with %zu bytes (got %zu)",
+                        expected_dy_bytes, nbytes(dy_b))));
+
+    b_fc_bytes = nbytes(b_fc_b);
+    b_proj_bytes = nbytes(b_proj_b);
+
+    if (b_fc_bytes == (Size) hidden_dim * sizeof(float))
+        b_fc_broadcast = true;
+    else if (b_fc_bytes == (Size) T * hidden_dim * sizeof(float))
+        b_fc_broadcast = false;
+    else
+        ereport(ERROR,
+                (errmsg("pg_llm_mlp_backward expected b_fc with %zu or %zu bytes (got %zu)",
+                        (Size) hidden_dim * sizeof(float),
+                        (Size) T * hidden_dim * sizeof(float),
+                        b_fc_bytes)));
+
+    if (b_proj_bytes == (Size) D * sizeof(float))
+        b_proj_broadcast = true;
+    else if (b_proj_bytes == (Size) T * D * sizeof(float))
+        b_proj_broadcast = false;
+    else
+        ereport(ERROR,
+                (errmsg("pg_llm_mlp_backward expected b_proj with %zu or %zu bytes (got %zu)",
+                        (Size) D * sizeof(float),
+                        (Size) T * D * sizeof(float),
+                        b_proj_bytes)));
+
+    x = as_float(x_b);
+    w_fc = as_float(w_fc_b);
+    b_fc = as_float(b_fc_b);
+    w_proj = as_float(w_proj_b);
+    b_proj = as_float(b_proj_b);
+    dy = as_float(dy_b);
+
+    dx_b = bytea_same_size(x_b);
+    dx = as_float(dx_b);
+    memset(dx, 0, expected_x_bytes);
+
+    dw_fc_b = bytea_same_size(w_fc_b);
+    dw_fc = as_float(dw_fc_b);
+    memset(dw_fc, 0, expected_w_fc_bytes);
+
+    db_fc_b = bytea_same_size(b_fc_b);
+    db_fc = as_float(db_fc_b);
+    memset(db_fc, 0, b_fc_bytes);
+
+    dw_proj_b = bytea_same_size(w_proj_b);
+    dw_proj = as_float(dw_proj_b);
+    memset(dw_proj, 0, expected_w_proj_bytes);
+
+    db_proj_b = bytea_same_size(b_proj_b);
+    db_proj = as_float(db_proj_b);
+    memset(db_proj, 0, b_proj_bytes);
+
+    fc_pre = (float *) palloc((Size) T * hidden_dim * sizeof(float));
+    fc_act = (float *) palloc((Size) T * hidden_dim * sizeof(float));
+    dfc = (float *) palloc((Size) T * hidden_dim * sizeof(float));
+
+    /* Forward recomputation */
+    for (int t = 0; t < T; ++t)
+    {
+        float *pre_row = fc_pre + (Size) t * hidden_dim;
+        float *act_row = fc_act + (Size) t * hidden_dim;
+        const float *x_row = x + (Size) t * D;
+        for (int h = 0; h < hidden_dim; ++h)
+        {
+            float sum = b_fc_broadcast ? b_fc[h] : b_fc[(Size) t * hidden_dim + h];
+            for (int d = 0; d < D; ++d)
+                sum += x_row[d] * w_fc[(Size) d * hidden_dim + h];
+            pre_row[h] = sum;
+            float x3 = sum * sum * sum;
+            act_row[h] = 0.5f * sum * (1.0f + tanhf(gelu_k * (sum + 0.044715f * x3)));
+        }
+    }
+
+    /* Gradients w.r.t. projection layer */
+    for (int t = 0; t < T; ++t)
+    {
+        const float *dy_row = dy + (Size) t * D;
+        if (!b_proj_broadcast)
+        {
+            float *db_row = db_proj + (Size) t * D;
+            memcpy(db_row, dy_row, (Size) D * sizeof(float));
+        }
+        for (int j = 0; j < D; ++j)
+        {
+            float grad = dy_row[j];
+            if (b_proj_broadcast)
+                db_proj[j] += grad;
+        }
+    }
+
+    for (int h = 0; h < hidden_dim; ++h)
+    {
+        const float *w_proj_row = w_proj + (Size) h * D;
+        for (int j = 0; j < D; ++j)
+        {
+            float accum = 0.0f;
+            for (int t = 0; t < T; ++t)
+            {
+                const float *act_row = fc_act + (Size) t * hidden_dim;
+                const float *dy_row = dy + (Size) t * D;
+                accum += act_row[h] * dy_row[j];
+            }
+            dw_proj[(Size) h * D + j] = accum;
+        }
+    }
+
+    for (int t = 0; t < T; ++t)
+    {
+        const float *dy_row = dy + (Size) t * D;
+        float *dfc_row = dfc + (Size) t * hidden_dim;
+        for (int h = 0; h < hidden_dim; ++h)
+        {
+            const float *w_proj_row = w_proj + (Size) h * D;
+            float accum = 0.0f;
+            for (int j = 0; j < D; ++j)
+                accum += dy_row[j] * w_proj_row[j];
+            dfc_row[h] = accum;
+        }
+    }
+
+    /* Backprop through GELU */
+    for (int t = 0; t < T; ++t)
+    {
+        float *dfc_row = dfc + (Size) t * hidden_dim;
+        float *pre_row = fc_pre + (Size) t * hidden_dim;
+        for (int h = 0; h < hidden_dim; ++h)
+        {
+            float xval = pre_row[h];
+            float x2 = xval * xval;
+            float x3 = x2 * xval;
+            float tanh_arg = gelu_k * (xval + 0.044715f * x3);
+            float tanh_val = tanhf(tanh_arg);
+            float sech2 = 1.0f - tanh_val * tanh_val;
+            float term = 0.5f * (1.0f + tanh_val + xval * sech2 * gelu_k * (1.0f + 3.0f * 0.044715f * x2));
+            dfc_row[h] *= term;
+        }
+    }
+
+    /* Gradients for b_fc */
+    if (b_fc_broadcast)
+    {
+        for (int h = 0; h < hidden_dim; ++h)
+        {
+            float sum = 0.0f;
+            for (int t = 0; t < T; ++t)
+                sum += dfc[(Size) t * hidden_dim + h];
+            db_fc[h] = sum;
+        }
+    }
+    else
+    {
+        memcpy(db_fc, dfc, (Size) T * hidden_dim * sizeof(float));
+    }
+
+    /* Gradients for w_fc */
+    for (int d = 0; d < D; ++d)
+    {
+        for (int h = 0; h < hidden_dim; ++h)
+        {
+            float accum = 0.0f;
+            for (int t = 0; t < T; ++t)
+            {
+                const float *x_row = x + (Size) t * D;
+                const float *dfc_row = dfc + (Size) t * hidden_dim;
+                accum += x_row[d] * dfc_row[h];
+            }
+            dw_fc[(Size) d * hidden_dim + h] = accum;
+        }
+    }
+
+    /* Gradients for x */
+    for (int t = 0; t < T; ++t)
+    {
+        float *dx_row = dx + (Size) t * D;
+        const float *dfc_row = dfc + (Size) t * hidden_dim;
+        for (int d = 0; d < D; ++d)
+        {
+            float accum = 0.0f;
+            for (int h = 0; h < hidden_dim; ++h)
+                accum += dfc_row[h] * w_fc[(Size) d * hidden_dim + h];
+            dx_row[d] = accum;
+        }
+    }
+
+    if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+        ereport(ERROR, (errmsg("expected composite return")));
+    BlessTupleDesc(tupdesc);
+
+    values[0] = PointerGetDatum(dx_b);
+    values[1] = PointerGetDatum(dw_fc_b);
+    values[2] = PointerGetDatum(db_fc_b);
+    values[3] = PointerGetDatum(dw_proj_b);
+    values[4] = PointerGetDatum(db_proj_b);
+
+    rettuple = heap_form_tuple(tupdesc, values, nulls);
     PG_RETURN_DATUM(HeapTupleGetDatum(rettuple));
 }
