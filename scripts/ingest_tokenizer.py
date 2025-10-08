@@ -25,7 +25,15 @@ from typing import Iterable, List, Tuple
 
 import psycopg
 from psycopg import sql
-from psycopg.extras import execute_values
+
+
+def _execute_values(cur: psycopg.Cursor, query: str, rows: Iterable[Tuple]) -> None:
+    rows = list(rows)
+    if not rows:
+        return
+    placeholder = "(" + ", ".join(["%s"] * len(rows[0])) + ")"
+    statement = query.replace("VALUES %s", f"VALUES {placeholder}")
+    cur.executemany(statement, rows)
 
 
 def load_vocab_rows(model: str, path: Path) -> List[Tuple[str, int, str, float | None, bytes]]:
@@ -53,7 +61,7 @@ def load_merge_rows(model: str, path: Path) -> List[Tuple[str, int, str, str, st
 
 def ingest_vocab(conn: psycopg.Connection, model: str, rows: Iterable[Tuple[str, int, str, float | None, bytes]]) -> None:
     with conn.cursor() as cur:
-        execute_values(
+        _execute_values(
             cur,
             """
             INSERT INTO llm_bpe_vocab(model, token_id, token, score, bytes)
@@ -71,15 +79,15 @@ def ingest_vocab(conn: psycopg.Connection, model: str, rows: Iterable[Tuple[str,
 
 def ingest_merges(conn: psycopg.Connection, model: str, rows: Iterable[Tuple[str, int, str, str, str]]) -> None:
     with conn.cursor() as cur:
-        execute_values(
+        _execute_values(
             cur,
             """
-            INSERT INTO llm_bpe_merges(model, rank, left, right, pair)
+            INSERT INTO llm_bpe_merges(model, rank, "left", "right", pair)
             VALUES %s
             ON CONFLICT (rank) DO UPDATE
             SET model = EXCLUDED.model,
-                left = EXCLUDED.left,
-                right = EXCLUDED.right,
+                "left" = EXCLUDED."left",
+                "right" = EXCLUDED."right",
                 pair = EXCLUDED.pair;
             """,
             list(rows),

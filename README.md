@@ -193,6 +193,9 @@ python scripts/prepare_dataset.py \
   --block-size 1024 --truncate
 ```
 
+An end-to-end walkthrough that stitches the helper scripts together is available
+in [docs/python_workflow.md](docs/python_workflow.md).
+
 ---
 
 ## Mathematical Fidelity
