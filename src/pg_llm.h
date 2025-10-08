@@ -87,4 +87,31 @@ static inline void ensure_same_size(bytea *a, bytea *b, const char *fn_name) {
     }
 }
 
+static inline void ensure_float_elements(bytea *b, size_t expected_elems,
+                                         const char *fn_name, const char *arg_name)
+{
+    Size size = nbytes(b);
+    Size expected_bytes;
+
+    if (expected_elems > SIZE_MAX / sizeof(float))
+        ereport(ERROR,
+                (errmsg("%s expected %s to contain %zu float32 elements, but the size exceeds limits",
+                        fn_name, arg_name, expected_elems)));
+
+    expected_bytes = (Size) expected_elems * sizeof(float);
+    if (size != expected_bytes)
+        ereport(ERROR,
+                (errmsg("%s expected %s to have %zu float32 elements (%zu bytes) but got %zu bytes",
+                        fn_name, arg_name, expected_elems, expected_bytes, size)));
+}
+
+static inline size_t safe_mul_elems(size_t a, size_t b,
+                                    const char *fn_name, const char *context)
+{
+    if (b != 0 && a > SIZE_MAX / b)
+        ereport(ERROR,
+                (errmsg("%s overflow while computing %s element count", fn_name, context)));
+    return a * b;
+}
+
 #endif

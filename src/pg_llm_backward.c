@@ -19,9 +19,14 @@ pg_llm_gelu_backward(PG_FUNCTION_ARGS)
     float *dx;
     const float k = 0.79788456f;
 
-    n = (int)(nbytes(x_b)/sizeof(float));
-    out = (bytea*) palloc(n*sizeof(float)+VARHDRSZ);
-    SET_VARSIZE(out,n*sizeof(float)+VARHDRSZ);
+    ensure_same_size(x_b, dy_b, "pg_llm_gelu_backward");
+
+    n = float_length(x_b, "pg_llm_gelu_backward");
+    (void) float_length(dy_b, "pg_llm_gelu_backward");
+    if (n == 0)
+        ereport(ERROR, (errmsg("pg_llm_gelu_backward requires a non-empty input")));
+
+    out = bytea_same_size(x_b);
 
     x = as_float(x_b);
     dy= as_float(dy_b);
@@ -45,15 +50,21 @@ pg_llm_softmax_backward(PG_FUNCTION_ARGS)
 {
     bytea *y_b  = PG_GETARG_BYTEA_P(0);  /* output of softmax */
     bytea *dy_b = PG_GETARG_BYTEA_P(1);  /* upstream gradient */
-    int n = (int)(nbytes(y_b)/sizeof(float));
+    int n;
     bytea *out;
     float *y;
     float *dy;
     float *dx;
     float dot = 0.f;
 
-    out = (bytea*) palloc(n*sizeof(float)+VARHDRSZ);
-    SET_VARSIZE(out, n*sizeof(float)+VARHDRSZ);
+    ensure_same_size(y_b, dy_b, "pg_llm_softmax_backward");
+
+    n = float_length(y_b, "pg_llm_softmax_backward");
+    (void) float_length(dy_b, "pg_llm_softmax_backward");
+    if (n == 0)
+        ereport(ERROR, (errmsg("pg_llm_softmax_backward requires non-empty inputs")));
+
+    out = bytea_same_size(y_b);
 
     y  = as_float(y_b);
     dy = as_float(dy_b);
@@ -178,7 +189,7 @@ pg_llm_layernorm_backward(PG_FUNCTION_ARGS)
     bytea *gamma_b = PG_GETARG_BYTEA_P(2);
     float eps = PG_GETARG_FLOAT4(3);
 
-    int n = (int)(nbytes(x_b)/sizeof(float));
+    int n;
     float *x;
     float *dy;
     float *g;
@@ -199,20 +210,29 @@ pg_llm_layernorm_backward(PG_FUNCTION_ARGS)
     bool nulls[3] = {false,false,false};
     HeapTuple rettuple;
 
+    ensure_same_size(x_b, dy_b, "pg_llm_layernorm_backward");
+    ensure_same_size(x_b, gamma_b, "pg_llm_layernorm_backward");
+
+    n = float_length(x_b, "pg_llm_layernorm_backward");
+    (void) float_length(dy_b, "pg_llm_layernorm_backward");
+    (void) float_length(gamma_b, "pg_llm_layernorm_backward");
+    if (n == 0)
+        ereport(ERROR, (errmsg("pg_llm_layernorm_backward requires non-empty inputs")));
+    if (n > (int)(sizeof(xhat) / sizeof(xhat[0])))
+        ereport(ERROR,
+                (errmsg("pg_llm_layernorm_backward supports up to %zu elements", (Size)(sizeof(xhat) / sizeof(xhat[0])))));
+
     x  = as_float(x_b);
     dy = as_float(dy_b);
     g  = as_float(gamma_b);
 
-    dx_b = (bytea*) palloc(n*sizeof(float)+VARHDRSZ);
-    SET_VARSIZE(dx_b,n*sizeof(float)+VARHDRSZ);
+    dx_b = bytea_same_size(x_b);
     dx = as_float(dx_b);
 
-    dg_b = (bytea*) palloc(n*sizeof(float)+VARHDRSZ);
-    SET_VARSIZE(dg_b,n*sizeof(float)+VARHDRSZ);
+    dg_b = bytea_same_size(x_b);
     dg = as_float(dg_b);
 
-    db_b = (bytea*) palloc(n*sizeof(float)+VARHDRSZ);
-    SET_VARSIZE(db_b,n*sizeof(float)+VARHDRSZ);
+    db_b = bytea_same_size(x_b);
     db = as_float(db_b);
 
     /* compute mean/var */

@@ -24,7 +24,7 @@ Datum pg_llm_adamw_step(PG_FUNCTION_ARGS)
     float  wd   = PG_GETARG_FLOAT4(8);
     int    t    = PG_GETARG_INT32(9);
 
-    int n = (int)(nbytes(w_b) / sizeof(float));
+    int n;
     bytea *w_out;
     bytea *m_out;
     bytea *v_out;
@@ -42,12 +42,20 @@ Datum pg_llm_adamw_step(PG_FUNCTION_ARGS)
     bool nulls[3] = {false,false,false};
     HeapTuple rettuple;
 
-    w_out = (bytea*) palloc(n*sizeof(float) + VARHDRSZ);
-    m_out = (bytea*) palloc(n*sizeof(float) + VARHDRSZ);
-    v_out = (bytea*) palloc(n*sizeof(float) + VARHDRSZ);
-    SET_VARSIZE(w_out, n*sizeof(float) + VARHDRSZ);
-    SET_VARSIZE(m_out, n*sizeof(float) + VARHDRSZ);
-    SET_VARSIZE(v_out, n*sizeof(float) + VARHDRSZ);
+    ensure_same_size(w_b, g_b, "pg_llm_adamw_step");
+    ensure_same_size(w_b, m_b, "pg_llm_adamw_step");
+    ensure_same_size(w_b, v_b, "pg_llm_adamw_step");
+
+    n = float_length(w_b, "pg_llm_adamw_step");
+    (void) float_length(g_b, "pg_llm_adamw_step");
+    (void) float_length(m_b, "pg_llm_adamw_step");
+    (void) float_length(v_b, "pg_llm_adamw_step");
+    if (n == 0)
+        ereport(ERROR, (errmsg("pg_llm_adamw_step requires non-empty tensors")));
+
+    w_out = bytea_same_size(w_b);
+    m_out = bytea_same_size(m_b);
+    v_out = bytea_same_size(v_b);
 
     w = as_float(w_b);
     g = as_float(g_b);

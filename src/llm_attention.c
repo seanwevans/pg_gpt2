@@ -158,17 +158,53 @@ Datum pg_llm_attention(PG_FUNCTION_ARGS)
     const int64_t T = PG_GETARG_INT32(6);  /* sequence length */
     const int64_t D = PG_GETARG_INT32(7);  /* model dim */
 
-    float *x    = as_float(x_b);
-    float *w_qkv= as_float(w_qkvb);
-    float *w_o  = as_float(w_ob);
-    float *b_qkv= as_float(b_qkvb);
-    float *b_o  = as_float(b_ob);
+    size_t td_elems;
+    size_t three_d;
+    size_t weight_qkv_elems;
+    size_t weight_o_elems;
     bool autograd = pg_llm_autograd_enabled();
     int input_ids[5];
+    float *x;
+    float *w_qkv;
+    float *w_o;
+    float *b_qkv;
+    float *b_o;
+    bytea *out;
+    float *Y;
 
-    bytea *out = (bytea*) palloc(T*D*sizeof(float) + VARHDRSZ);
-    SET_VARSIZE(out, T*D*sizeof(float) + VARHDRSZ);
-    float *Y = as_float(out);
+    if (n_head <= 0)
+        ereport(ERROR, (errmsg("pg_llm_attention requires a positive head count")));
+    if (T <= 0 || D <= 0)
+        ereport(ERROR, (errmsg("pg_llm_attention requires positive T and D dimensions")));
+    if (D % n_head != 0)
+        ereport(ERROR,
+                (errmsg("pg_llm_attention expects model dimension divisible by head count")));
+
+    td_elems = safe_mul_elems((size_t) T, (size_t) D,
+                              "pg_llm_attention", "T*D");
+    three_d = safe_mul_elems((size_t) 3, (size_t) D,
+                             "pg_llm_attention", "3*D");
+    weight_qkv_elems = safe_mul_elems((size_t) D, three_d,
+                                      "pg_llm_attention", "D*3D");
+    weight_o_elems = safe_mul_elems((size_t) D, (size_t) D,
+                                    "pg_llm_attention", "D*D");
+    ensure_float_elements(x_b, td_elems, "pg_llm_attention", "x");
+    ensure_float_elements(w_qkvb, weight_qkv_elems,
+                         "pg_llm_attention", "w_qkv");
+    ensure_float_elements(b_qkvb, three_d,
+                         "pg_llm_attention", "b_qkv");
+    ensure_float_elements(w_ob, weight_o_elems,
+                         "pg_llm_attention", "w_o");
+    ensure_float_elements(b_ob, (size_t) D,
+                         "pg_llm_attention", "b_o");
+
+    out = bytea_same_size(x_b);
+    Y = as_float(out);
+    x = as_float(x_b);
+    w_qkv = as_float(w_qkvb);
+    w_o = as_float(w_ob);
+    b_qkv = as_float(b_qkvb);
+    b_o = as_float(b_ob);
 
     if (autograd)
     {
@@ -235,18 +271,40 @@ pg_llm_attention_backward(PG_FUNCTION_ARGS)
     const int head_dim = (int) (D / n_head);
     const float scale = 1.0f / sqrtf((float) head_dim);
 
+    size_t td_elems = safe_mul_elems((size_t) T, (size_t) D,
+                                     "pg_llm_attention_backward", "T*D");
+    size_t three_d = safe_mul_elems((size_t) 3, (size_t) D,
+                                    "pg_llm_attention_backward", "3*D");
+    size_t weight_qkv_elems = safe_mul_elems((size_t) D, three_d,
+                                             "pg_llm_attention_backward", "D*3D");
+    size_t weight_o_elems = safe_mul_elems((size_t) D, (size_t) D,
+                                           "pg_llm_attention_backward", "D*D");
+    size_t qkv_elems = safe_mul_elems((size_t) T, three_d,
+                                      "pg_llm_attention_backward", "T*3D");
+
+    ensure_float_elements(x_b, td_elems, "pg_llm_attention_backward", "x");
+    ensure_float_elements(w_qkv_b, weight_qkv_elems,
+                         "pg_llm_attention_backward", "w_qkv");
+    ensure_float_elements(b_qkv_b, three_d,
+                         "pg_llm_attention_backward", "b_qkv");
+    ensure_float_elements(w_o_b, weight_o_elems,
+                         "pg_llm_attention_backward", "w_o");
+    ensure_float_elements(b_o_b, (size_t) D,
+                         "pg_llm_attention_backward", "b_o");
+    ensure_float_elements(dy_b, td_elems,
+                         "pg_llm_attention_backward", "grad_output");
+
     float *x     = as_float(x_b);
     float *w_qkv = as_float(w_qkv_b);
     float *b_qkv = as_float(b_qkv_b);
     float *w_o   = as_float(w_o_b);
     float *dy    = as_float(dy_b);
 
-    Size qkv_elems = (Size) T * 3 * D;
-    Size td_elems = (Size) T * D;
+    Size qkv_elems_sz = (Size) qkv_elems;
 
-    float *qkv = (float *) palloc(qkv_elems * sizeof(float));
-    float *context = (float *) palloc(td_elems * sizeof(float));
-    memset(context, 0, td_elems * sizeof(float));
+    float *qkv = (float *) palloc(qkv_elems_sz * sizeof(float));
+    float *context = (float *) palloc((Size) td_elems * sizeof(float));
+    memset(context, 0, (Size) td_elems * sizeof(float));
 
     pg_llm_fast_gemm(x, w_qkv, qkv, (int) T, (int) D, (int) (3 * D));
     for (int64_t t = 0; t < T; ++t) {
@@ -322,13 +380,13 @@ pg_llm_attention_backward(PG_FUNCTION_ARGS)
     float *dw_o_out = as_float(dw_o_b_out);
     float *db_o_out = as_float(db_o_b_out);
 
-    memset(dx, 0, td_elems * sizeof(float));
+    memset(dx, 0, (Size) td_elems * sizeof(float));
     memset(dw_qkv_out, 0, ((Size) D * 3 * D) * sizeof(float));
     memset(db_qkv_out, 0, ((Size) 3 * D) * sizeof(float));
     memset(dw_o_out, 0, ((Size) D * D) * sizeof(float));
     memset(db_o_out, 0, ((Size) D) * sizeof(float));
 
-    float *d_context = (float *) palloc0(td_elems * sizeof(float));
+    float *d_context = (float *) palloc0((Size) td_elems * sizeof(float));
 
     for (int64_t t = 0; t < T; ++t) {
         const float *dy_row = dy + (Size) t * D;
@@ -350,9 +408,9 @@ pg_llm_attention_backward(PG_FUNCTION_ARGS)
         }
     }
 
-    float *dQ = (float *) palloc0(td_elems * sizeof(float));
-    float *dK = (float *) palloc0(td_elems * sizeof(float));
-    float *dV = (float *) palloc0(td_elems * sizeof(float));
+    float *dQ = (float *) palloc0((Size) td_elems * sizeof(float));
+    float *dK = (float *) palloc0((Size) td_elems * sizeof(float));
+    float *dV = (float *) palloc0((Size) td_elems * sizeof(float));
 
     float *dqkv = (float *) palloc0(qkv_elems * sizeof(float));
 
