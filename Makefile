@@ -5,9 +5,11 @@ SRCS := $(wildcard src/*.c)
 OBJS := $(SRCS:.c=.o)
 
 DATA = \
-sql/pg_llm--0.1.0.sql \
-sql/llm_block_forward.sql \
-sql/llm_backprop.sql
+sql/pg_llm--0.1.0.sql
+
+EXTRA_SCRIPTS = \
+scripts/sql/llm_block_forward.sql \
+scripts/sql/llm_backprop.sql
 
 REGRESS = adamw dropout
 REGRESS_OPTS = --dlpath=$(abs_builddir)

@@ -87,7 +87,7 @@ so that gradients can be replayed later. The key moving pieces are:
    to the seed, dispatching gradients based on the recorded `name` field and
    writing results into `llm_tensor_rt.grad`. Once complete, `llm_accumulate_grads`
    copies those buffers back into `llm_param.grad` using the mapping created in
-   step 1. 【F:sql/llm_backprop.sql†L1-L78】【F:sql/pg_llm--0.1.0.sql†L439-L456】
+   step 1. 【F:scripts/sql/llm_backprop.sql†L1-L78】【F:sql/pg_llm--0.1.0.sql†L439-L456】
 4. **Tied embeddings.** GPT-2 reuses the token embedding (`wte`) for the final
    logits projection. After flattening the embedding table into a single matrix
    for `pg_llm_matmul`, ensure that buffer is still mapped to the original
