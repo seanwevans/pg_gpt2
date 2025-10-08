@@ -1,0 +1,23 @@
+SET
+SET
+TRUNCATE TABLE
+CREATE FUNCTION
+CREATE FUNCTION
+CREATE FUNCTION
+ setseed 
+---------
+ 
+(1 row)
+
+DO
+INSERT 0 100
+ llm_train 
+-----------
+ 
+(1 row)
+
+DO
+            label            | logged_steps 
+----------------------------+--------------
+ tiny_e2e loss decreased    |           10
+(1 row)
