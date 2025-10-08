@@ -1,0 +1,51 @@
+SET
+CREATE FUNCTION
+DROP FUNCTION
+NOTICE:  function arr_to_bytea(float4[]) does not exist, skipping
+CREATE FUNCTION
+DROP FUNCTION
+NOTICE:  function pg_llm_ones_like(bytea) does not exist, skipping
+CREATE FUNCTION
+DROP FUNCTION
+NOTICE:  function pg_llm_zeros_like(bytea) does not exist, skipping
+CREATE FUNCTION
+DROP FUNCTION
+NOTICE:  function pg_llm_add(bytea,bytea) does not exist, skipping
+CREATE FUNCTION
+DROP FUNCTION
+NOTICE:  function pg_llm_transpose(bytea,integer,integer) does not exist, skipping
+CREATE FUNCTION
+DROP FUNCTION
+NOTICE:  function pg_llm_matmul(bytea,bytea,integer,integer,integer) does not exist, skipping
+CREATE FUNCTION
+DROP TABLE
+NOTICE:  table "llm_tape" does not exist, skipping
+CREATE TABLE
+DROP TABLE
+NOTICE:  table "llm_tensor_rt" does not exist, skipping
+CREATE TABLE
+DROP TABLE
+NOTICE:  table "llm_tensor_map" does not exist, skipping
+CREATE TABLE
+TRUNCATE TABLE
+TRUNCATE TABLE
+TRUNCATE TABLE
+CREATE TABLE
+INSERT 0 3
+INSERT 0 3
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+INSERT 0 2
+ llm_backprop 
+--------------
+ 
+(1 row)
+
+   token_label   |    grad_hex     |  expected_hex   | matches 
+-----------------+-----------------+-----------------+---------
+ token 0         | 0000404100009041 | 0000404100009041 | t
+ token 1         | 0000e04100002842 | 0000e04100002842 | t
+ token 2         | 0000304200008442 | 0000304200008442 | t
+(3 rows)
