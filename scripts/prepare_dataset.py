@@ -24,7 +24,16 @@ from pathlib import Path
 from typing import Iterable, Iterator, List, Sequence, Tuple
 
 import psycopg
-from psycopg.extras import execute_values
+
+
+def _execute_values(cur: psycopg.Cursor, query: str, rows: Iterable[Tuple[List[int], List[int]]]) -> int:
+    materialized = list(rows)
+    if not materialized:
+        return 0
+    placeholder = "(" + ", ".join(["%s"] * len(materialized[0])) + ")"
+    statement = query.replace("VALUES %s", f"VALUES {placeholder}")
+    cur.executemany(statement, materialized)
+    return len(materialized)
 
 
 def _lazy_import_tokenizer():
@@ -75,12 +84,14 @@ def insert_examples(conn: psycopg.Connection, rows: Iterable[Tuple[List[int], Li
         for row in rows:
             batch.append(row)
             if len(batch) >= batch_size:
-                execute_values(cur, "INSERT INTO llm_dataset(tokens, target) VALUES %s", batch)
-                total += len(batch)
+                total += _execute_values(
+                    cur, "INSERT INTO llm_dataset(tokens, target) VALUES %s", batch
+                )
                 batch.clear()
         if batch:
-            execute_values(cur, "INSERT INTO llm_dataset(tokens, target) VALUES %s", batch)
-            total += len(batch)
+            total += _execute_values(
+                cur, "INSERT INTO llm_dataset(tokens, target) VALUES %s", batch
+            )
     conn.commit()
     return total
 
