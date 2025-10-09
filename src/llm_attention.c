@@ -238,7 +238,6 @@ attention_compute(float *x, float *w_qkv, float *b_qkv,
  * returns: BYTEA (T×D)
  */
 PG_FUNCTION_INFO_V1(pg_llm_attention);
-PG_FUNCTION_INFO_V1(pg_llm_attention_backward);
 Datum pg_llm_attention(PG_FUNCTION_ARGS)
 {
     bytea *x_b    = PG_GETARG_BYTEA_P(0);

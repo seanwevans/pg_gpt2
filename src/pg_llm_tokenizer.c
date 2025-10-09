@@ -20,7 +20,7 @@ Datum pg_llm_load_bpe_vocab(PG_FUNCTION_ARGS)
         "SELECT $1, value::INT, key, convert_to(key, 'UTF8') "
         "FROM json_each_text($2::json) ON CONFLICT DO NOTHING;";
     Oid argtypes[2] = {TEXTOID, TEXTOID};
-    bool nulls[2] = {false, false};
+    char nulls[2] = {' ', ' '};
     Datum model_datum;
     Datum vocab_json;
 
@@ -97,7 +97,7 @@ Datum pg_llm_load_bpe_merges(PG_FUNCTION_ARGS)
         "INSERT INTO llm_bpe_merges(model,rank,left,right,pair)"
         "VALUES($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING;";
     Oid argtypes[5] = {TEXTOID, INT4OID, TEXTOID, TEXTOID, TEXTOID};
-    bool nulls[5] = {false, false, false, false, false};
+    char nulls[5] = {' ', ' ', ' ', ' ', ' '};
     Datum model_datum;
 
     if (!f)

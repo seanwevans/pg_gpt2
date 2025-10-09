@@ -7,6 +7,7 @@
 #include "utils/array.h"
 #include "utils/hsearch.h"
 #include "utils/memutils.h"
+#include "utils/lsyscache.h"
 
 typedef struct TensorRegistryEntry
 {
@@ -17,6 +18,16 @@ typedef struct TensorRegistryEntry
 static HTAB *tensor_registry = NULL;
 
 PG_FUNCTION_INFO_V1(pg_llm_autograd_map_param);
+
+static bool autograd_enabled(void);
+static int tape_insert(const char *name, int *inputs, int n_in, int output, const char *extra_json);
+static int insert_tensor_rt(bytea *tensor, int ndims, const int *dims, bool requires_grad);
+static void pg_llm_autograd_map_param_internal(const char *model,
+                                               const char *name,
+                                               int token_id,
+                                               bytea *tensor,
+                                               int ndims,
+                                               const int *dims);
 
 static void
 ensure_tensor_registry(void)
@@ -53,14 +64,6 @@ build_shape_array(int ndims, const int *dims)
 
     return construct_array(elems, ndims, INT4OID, elmlen, elmbyval, elmalign);
 }
-
-static int
-tape_insert(const char *name, int *inputs, int n_in, int output, const char *extra_json)
-{
-    StringInfoData buf;
-
-static bool autograd_enabled(void);
-static int tape_insert(const char *name, int *inputs, int n_in, int output, const char *extra_json) PG_USED_FOR_ASSERTS_ONLY;
 
 static bool
 autograd_enabled(void)
@@ -153,7 +156,7 @@ static int
 insert_tensor_rt(bytea *tensor, int ndims, const int *dims, bool requires_grad)
 {
     Datum       values[3];
-    bool        nulls[3] = {false, false, false};
+    char        nulls[3] = {' ', ' ', ' '};
     Oid         argtypes[3] = {BYTEAOID, INT4ARRAYOID, BOOLOID};
     int         ret;
     bool        isnull;
@@ -164,7 +167,7 @@ insert_tensor_rt(bytea *tensor, int ndims, const int *dims, bool requires_grad)
     if (shape)
         values[1] = PointerGetDatum(shape);
     else
-        nulls[1] = true;
+        nulls[1] = 'n';
     values[2] = BoolGetDatum(requires_grad);
 
     ret = SPI_execute_with_args(
@@ -223,7 +226,7 @@ pg_llm_autograd_map_param_internal(const char *model,
                                    const int *dims)
 {
     Datum       values[4];
-    bool        nulls[4] = {false, false, false, false};
+    char        nulls[4] = {' ', ' ', ' ', ' '};
     Oid         argtypes[4] = {TEXTOID, TEXTOID, INT4OID, INT4OID};
     int         tensor_id;
     int         ret;
@@ -265,8 +268,6 @@ pg_llm_autograd_map_param_internal(const char *model,
 
     SPI_finish();
 }
-
-PG_FUNCTION_INFO_V1(pg_llm_autograd_map_param);
 
 Datum
 pg_llm_autograd_map_param(PG_FUNCTION_ARGS)
