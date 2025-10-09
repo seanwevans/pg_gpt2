@@ -1,14 +1,62 @@
 #include "pg_llm.h"
+#include <limits.h>
 #include <string.h>
 
 #define PG_LLM_ATTENTION_CHUNK 64
+
+static Size
+checked_mul_size(Size a, Size b, const char *context)
+{
+    if (a != 0 && b > SIZE_MAX / a)
+        ereport(ERROR,
+                (errmsg("%s size overflow", context)));
+    return a * b;
+}
+
+static Size
+bytea_num_floats(bytea *b, const char *fn_name)
+{
+    Size size = nbytes(b);
+
+    if (size % sizeof(float) != 0)
+        ereport(ERROR,
+                (errmsg("%s expected a float32-aligned bytea (got %zu bytes)",
+                        fn_name, size)));
+
+    return size / sizeof(float);
+}
+
+static void
+validate_attention_dims(const char *fn_name, int n_head, int64_t T, int64_t D)
+{
+    if (n_head <= 0)
+        ereport(ERROR,
+                (errmsg("%s requires a positive number of heads", fn_name)));
+    if (T <= 0 || D <= 0)
+        ereport(ERROR,
+                (errmsg("%s requires positive sequence length and model dimension",
+                        fn_name)));
+    if (T > INT_MAX || D > INT_MAX)
+        ereport(ERROR,
+                (errmsg("%s dimensions exceed implementation limits (T=%lld, D=%lld)",
+                        fn_name, (long long) T, (long long) D)));
+    if (D % n_head != 0)
+        ereport(ERROR,
+                (errmsg("%s requires the model dimension to be divisible by number of heads",
+                        fn_name)));
+}
 
 static void
 attention_compute(float *x, float *w_qkv, float *b_qkv,
                   float *w_o, float *b_o,
                   int n_head, int64_t T, int64_t D, float *Y)
 {
-    const int head_dim = D / n_head;
+    const char *fn_name = "pg_llm_attention";
+    const char *alloc_ctx = "pg_llm_attention workspace";
+
+    validate_attention_dims(fn_name, n_head, T, D);
+
+    const int head_dim = (int) (D / n_head);
     const float scale = 1.0f / sqrtf((float)head_dim);
     float *qkv = NULL;
     float *Q;
@@ -22,10 +70,26 @@ attention_compute(float *x, float *w_qkv, float *b_qkv,
     float *proj = NULL;
     const int chunk_rows = Min(PG_LLM_ATTENTION_CHUNK, (int)T);
     const int pack_block = 32;
+    Size T_sz = (Size) T;
+    Size D_sz = (Size) D;
+    Size head_dim_sz = (Size) head_dim;
+    Size chunk_rows_sz = (Size) chunk_rows;
+    Size qkv_elems = checked_mul_size(checked_mul_size(T_sz, (Size) 3, alloc_ctx),
+                                      D_sz,
+                                      alloc_ctx);
+    Size qkv_bytes = checked_mul_size(qkv_elems, sizeof(float), alloc_ctx);
+    Size chunk_elems = checked_mul_size(chunk_rows_sz, head_dim_sz, alloc_ctx);
+    Size chunk_bytes = checked_mul_size(chunk_elems, sizeof(float), alloc_ctx);
+    Size score_elems = checked_mul_size(chunk_rows_sz, T_sz, alloc_ctx);
+    Size score_bytes = checked_mul_size(score_elems, sizeof(float), alloc_ctx);
+    Size head_T_elems = checked_mul_size(head_dim_sz, T_sz, alloc_ctx);
+    Size head_T_bytes = checked_mul_size(head_T_elems, sizeof(float), alloc_ctx);
+    Size proj_elems = checked_mul_size(T_sz, D_sz, alloc_ctx);
+    Size proj_bytes = checked_mul_size(proj_elems, sizeof(float), alloc_ctx);
 
     PG_TRY();
     {
-        qkv = (float *) palloc((Size)T * 3 * D * sizeof(float));
+        qkv = (float *) palloc(qkv_bytes);
         pg_llm_fast_gemm(x, w_qkv, qkv, T, D, 3 * D);
         for (int t = 0; t < T; ++t) {
             float *row = qkv + (Size)t * 3 * D;
@@ -36,11 +100,11 @@ attention_compute(float *x, float *w_qkv, float *b_qkv,
         K = qkv + (Size)T * D;
         V = qkv + (Size)2 * T * D;
 
-        Q_chunk = (float *) palloc((Size)chunk_rows * head_dim * sizeof(float));
-        score_chunk = (float *) palloc((Size)chunk_rows * T * sizeof(float));
-        context_chunk = (float *) palloc((Size)chunk_rows * head_dim * sizeof(float));
-        K_head_T = (float *) palloc((Size)head_dim * T * sizeof(float));
-        V_head = (float *) palloc((Size)T * head_dim * sizeof(float));
+        Q_chunk = (float *) palloc(chunk_bytes);
+        score_chunk = (float *) palloc(score_bytes);
+        context_chunk = (float *) palloc(chunk_bytes);
+        K_head_T = (float *) palloc(head_T_bytes);
+        V_head = (float *) palloc(head_T_bytes);
 
         for (int h = 0; h < n_head; ++h) {
             int off = h * head_dim;
@@ -117,7 +181,7 @@ attention_compute(float *x, float *w_qkv, float *b_qkv,
 
         }
 
-        proj = (float *) palloc((Size)T * D * sizeof(float));
+        proj = (float *) palloc(proj_bytes);
         pg_llm_fast_gemm(Y, w_o, proj, T, D, D);
         for (int t = 0; t < T; ++t) {
             float *dst = proj + (Size)t * D;
@@ -187,16 +251,65 @@ Datum pg_llm_attention(PG_FUNCTION_ARGS)
     const int64_t T = PG_GETARG_INT32(6);  /* sequence length */
     const int64_t D = PG_GETARG_INT32(7);  /* model dim */
 
-    float *x    = as_float(x_b);
-    float *w_qkv= as_float(w_qkvb);
-    float *w_o  = as_float(w_ob);
-    float *b_qkv= as_float(b_qkvb);
-    float *b_o  = as_float(b_ob);
+    const char *fn_name = "pg_llm_attention";
+    Size T_sz;
+    Size D_sz;
+    Size td_elems;
+    Size td_bytes;
+    Size qkv_param_elems;
+    Size b_qkv_elems;
+    Size proj_param_elems;
+    Size bias_proj_elems;
+
+    validate_attention_dims(fn_name, n_head, T, D);
+
+    T_sz = (Size) T;
+    D_sz = (Size) D;
+    td_elems = checked_mul_size(T_sz, D_sz, "pg_llm_attention activations elements");
+    td_bytes = checked_mul_size(td_elems, sizeof(float), "pg_llm_attention activations bytes");
+    qkv_param_elems = checked_mul_size(checked_mul_size(D_sz, (Size) 3, "pg_llm_attention qkv param elements"),
+                                       D_sz,
+                                       "pg_llm_attention qkv param elements");
+    b_qkv_elems = checked_mul_size((Size) 3, D_sz, "pg_llm_attention qkv bias elements");
+    proj_param_elems = checked_mul_size(D_sz, D_sz, "pg_llm_attention projection param elements");
+    bias_proj_elems = D_sz;
+
+    Size x_elems = bytea_num_floats(x_b, fn_name);
+    Size w_qkv_elems = bytea_num_floats(w_qkvb, fn_name);
+    Size b_qkv_actual = bytea_num_floats(b_qkvb, fn_name);
+    Size w_o_elems = bytea_num_floats(w_ob, fn_name);
+    Size b_o_elems = bytea_num_floats(b_ob, fn_name);
+
+    if (x_elems != td_elems)
+        ereport(ERROR,
+                (errmsg("pg_llm_attention expected x with %zu floats (got %zu)",
+                        td_elems, x_elems)));
+    if (w_qkv_elems != qkv_param_elems)
+        ereport(ERROR,
+                (errmsg("pg_llm_attention expected w_qkv with %zu floats (got %zu)",
+                        qkv_param_elems, w_qkv_elems)));
+    if (b_qkv_actual != b_qkv_elems)
+        ereport(ERROR,
+                (errmsg("pg_llm_attention expected b_qkv with %zu floats (got %zu)",
+                        b_qkv_elems, b_qkv_actual)));
+    if (w_o_elems != proj_param_elems)
+        ereport(ERROR,
+                (errmsg("pg_llm_attention expected w_o with %zu floats (got %zu)",
+                        proj_param_elems, w_o_elems)));
+    if (b_o_elems != bias_proj_elems)
+        ereport(ERROR,
+                (errmsg("pg_llm_attention expected b_o with %zu floats (got %zu)",
+                        bias_proj_elems, b_o_elems)));
+
+    float *x     = as_float(x_b);
+    float *w_qkv = as_float(w_qkvb);
+    float *w_o   = as_float(w_ob);
+    float *b_qkv = as_float(b_qkvb);
+    float *b_o   = as_float(b_ob);
     bool autograd = pg_llm_autograd_enabled();
     int input_ids[5];
 
-    bytea *out = (bytea*) palloc(T*D*sizeof(float) + VARHDRSZ);
-    SET_VARSIZE(out, T*D*sizeof(float) + VARHDRSZ);
+    bytea *out = bytea_alloc(td_bytes);
     float *Y = as_float(out);
 
     bool spi_connected = false;
@@ -265,10 +378,84 @@ pg_llm_attention_backward(PG_FUNCTION_ARGS)
     int64_t T      = PG_GETARG_INT32(7);
     int64_t D      = PG_GETARG_INT32(8);
 
-    if (n_head <= 0 || D <= 0 || T <= 0)
-        ereport(ERROR, (errmsg("pg_llm_attention_backward requires positive dimensions")));
-    if (D % n_head != 0)
-        ereport(ERROR, (errmsg("model dimension must be divisible by number of heads")));
+    const char *fn_name = "pg_llm_attention_backward";
+    Size T_sz;
+    Size D_sz;
+    Size n_head_sz;
+    Size td_elems;
+    Size td_bytes;
+    Size qkv_elems;
+    Size qkv_bytes;
+    Size param_qkv_elems;
+    Size param_qkv_bytes;
+    Size b_qkv_elems;
+    Size b_qkv_bytes;
+    Size proj_param_elems;
+    Size proj_param_bytes;
+    Size bias_proj_elems;
+    Size bias_proj_bytes;
+    Size attn_elems;
+    Size attn_bytes;
+    Size tt_elems;
+    Size tt_bytes;
+
+    validate_attention_dims(fn_name, n_head, T, D);
+
+    T_sz = (Size) T;
+    D_sz = (Size) D;
+    n_head_sz = (Size) n_head;
+    td_elems = checked_mul_size(T_sz, D_sz, "pg_llm_attention_backward activations elements");
+    td_bytes = checked_mul_size(td_elems, sizeof(float), "pg_llm_attention_backward activations bytes");
+    qkv_elems = checked_mul_size(checked_mul_size(T_sz, (Size) 3, "pg_llm_attention_backward qkv workspace elements"),
+                                 D_sz,
+                                 "pg_llm_attention_backward qkv workspace elements");
+    qkv_bytes = checked_mul_size(qkv_elems, sizeof(float), "pg_llm_attention_backward qkv workspace bytes");
+    param_qkv_elems = checked_mul_size(checked_mul_size(D_sz, (Size) 3, "pg_llm_attention_backward qkv param elements"),
+                                       D_sz,
+                                       "pg_llm_attention_backward qkv param elements");
+    param_qkv_bytes = checked_mul_size(param_qkv_elems, sizeof(float), "pg_llm_attention_backward qkv param bytes");
+    b_qkv_elems = checked_mul_size((Size) 3, D_sz, "pg_llm_attention_backward qkv bias elements");
+    b_qkv_bytes = checked_mul_size(b_qkv_elems, sizeof(float), "pg_llm_attention_backward qkv bias bytes");
+    proj_param_elems = checked_mul_size(D_sz, D_sz, "pg_llm_attention_backward projection param elements");
+    proj_param_bytes = checked_mul_size(proj_param_elems, sizeof(float), "pg_llm_attention_backward projection param bytes");
+    bias_proj_elems = D_sz;
+    bias_proj_bytes = checked_mul_size(bias_proj_elems, sizeof(float), "pg_llm_attention_backward projection bias bytes");
+    tt_elems = checked_mul_size(T_sz, T_sz, "pg_llm_attention_backward time-step square elements");
+    tt_bytes = checked_mul_size(tt_elems, sizeof(float), "pg_llm_attention_backward time-step square bytes");
+    attn_elems = checked_mul_size(n_head_sz, tt_elems, "pg_llm_attention_backward attention tensor elements");
+    attn_bytes = checked_mul_size(attn_elems, sizeof(float), "pg_llm_attention_backward attention tensor bytes");
+
+    Size x_elems = bytea_num_floats(x_b, fn_name);
+    Size w_qkv_param = bytea_num_floats(w_qkv_b, fn_name);
+    Size b_qkv_param = bytea_num_floats(b_qkv_b, fn_name);
+    Size w_o_param = bytea_num_floats(w_o_b, fn_name);
+    Size b_o_param = bytea_num_floats(b_o_b, fn_name);
+    Size dy_elems = bytea_num_floats(dy_b, fn_name);
+
+    if (x_elems != td_elems)
+        ereport(ERROR,
+                (errmsg("pg_llm_attention_backward expected x with %zu floats (got %zu)",
+                        td_elems, x_elems)));
+    if (dy_elems != td_elems)
+        ereport(ERROR,
+                (errmsg("pg_llm_attention_backward expected dy with %zu floats (got %zu)",
+                        td_elems, dy_elems)));
+    if (w_qkv_param != param_qkv_elems)
+        ereport(ERROR,
+                (errmsg("pg_llm_attention_backward expected w_qkv with %zu floats (got %zu)",
+                        param_qkv_elems, w_qkv_param)));
+    if (b_qkv_param != b_qkv_elems)
+        ereport(ERROR,
+                (errmsg("pg_llm_attention_backward expected b_qkv with %zu floats (got %zu)",
+                        b_qkv_elems, b_qkv_param)));
+    if (w_o_param != proj_param_elems)
+        ereport(ERROR,
+                (errmsg("pg_llm_attention_backward expected w_o with %zu floats (got %zu)",
+                        proj_param_elems, w_o_param)));
+    if (b_o_param != bias_proj_elems)
+        ereport(ERROR,
+                (errmsg("pg_llm_attention_backward expected b_o with %zu floats (got %zu)",
+                        bias_proj_elems, b_o_param)));
 
     const int head_dim = (int) (D / n_head);
     const float scale = 1.0f / sqrtf((float) head_dim);
@@ -278,9 +465,6 @@ pg_llm_attention_backward(PG_FUNCTION_ARGS)
     float *b_qkv = as_float(b_qkv_b);
     float *w_o   = as_float(w_o_b);
     float *dy    = as_float(dy_b);
-
-    Size qkv_elems = (Size) T * 3 * D;
-    Size td_elems = (Size) T * D;
 
     float *qkv = NULL;
     float *context = NULL;
@@ -310,9 +494,9 @@ pg_llm_attention_backward(PG_FUNCTION_ARGS)
 
     PG_TRY();
     {
-        qkv = (float *) palloc(qkv_elems * sizeof(float));
-        context = (float *) palloc(td_elems * sizeof(float));
-        memset(context, 0, td_elems * sizeof(float));
+        qkv = (float *) palloc(qkv_bytes);
+        context = (float *) palloc(td_bytes);
+        memset(context, 0, td_bytes);
 
         pg_llm_fast_gemm(x, w_qkv, qkv, (int) T, (int) D, (int) (3 * D));
         for (int64_t t = 0; t < T; ++t) {
@@ -325,7 +509,7 @@ pg_llm_attention_backward(PG_FUNCTION_ARGS)
         float *K = qkv + (Size) T * D;
         float *V = qkv + (Size) 2 * T * D;
 
-        attn = (float *) palloc0((Size) n_head * T * T * sizeof(float));
+        attn = (float *) palloc0(attn_bytes);
 
         for (int h = 0; h < n_head; ++h) {
             int off = h * head_dim;
@@ -388,13 +572,13 @@ pg_llm_attention_backward(PG_FUNCTION_ARGS)
         dw_o_out = as_float(dw_o_b_out);
         db_o_out = as_float(db_o_b_out);
 
-        memset(dx, 0, td_elems * sizeof(float));
-        memset(dw_qkv_out, 0, ((Size) D * 3 * D) * sizeof(float));
-        memset(db_qkv_out, 0, ((Size) 3 * D) * sizeof(float));
-        memset(dw_o_out, 0, ((Size) D * D) * sizeof(float));
-        memset(db_o_out, 0, ((Size) D) * sizeof(float));
+        memset(dx, 0, td_bytes);
+        memset(dw_qkv_out, 0, param_qkv_bytes);
+        memset(db_qkv_out, 0, b_qkv_bytes);
+        memset(dw_o_out, 0, proj_param_bytes);
+        memset(db_o_out, 0, bias_proj_bytes);
 
-        d_context = (float *) palloc0(td_elems * sizeof(float));
+        d_context = (float *) palloc0(td_bytes);
 
         for (int64_t t = 0; t < T; ++t) {
             const float *dy_row = dy + (Size) t * D;
@@ -413,17 +597,17 @@ pg_llm_attention_backward(PG_FUNCTION_ARGS)
                     dctx_row[i] += dy_row[j] * w_o[(Size) i * D + j];
         }
 
-        dQ = (float *) palloc0(td_elems * sizeof(float));
-        dK = (float *) palloc0(td_elems * sizeof(float));
-        dV = (float *) palloc0(td_elems * sizeof(float));
+        dQ = (float *) palloc0(td_bytes);
+        dK = (float *) palloc0(td_bytes);
+        dV = (float *) palloc0(td_bytes);
 
-        dqkv = (float *) palloc0(qkv_elems * sizeof(float));
+        dqkv = (float *) palloc0(qkv_bytes);
 
         for (int h = 0; h < n_head; ++h) {
             int off = h * head_dim;
             float *attn_head = attn + (Size) h * T * T;
-            dP = (float *) palloc0((Size) T * T * sizeof(float));
-            dS = (float *) palloc0((Size) T * T * sizeof(float));
+            dP = (float *) palloc0(tt_bytes);
+            dS = (float *) palloc0(tt_bytes);
 
             for (int64_t t = 0; t < T; ++t) {
                 const float *dctx_row = d_context + (Size) t * D + off;
