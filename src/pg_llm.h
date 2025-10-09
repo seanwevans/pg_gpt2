@@ -60,15 +60,6 @@ static inline bytea* bytea_same_size(bytea *src) {
     return bytea_alloc(nbytes(src));
 }
 
-static inline bytea* bytea_constant_like(bytea *src, const char *fn_name, float value) {
-    int n = float_length(src, fn_name);
-    bytea *out = bytea_same_size(src);
-    float *dst = as_float(out);
-    for (int i = 0; i < n; i++)
-        dst[i] = value;
-    return out;
-}
-
 static inline int float_length(bytea *b, const char *fn_name) {
     Size size = nbytes(b);
     if (size % sizeof(float) != 0)
@@ -76,6 +67,15 @@ static inline int float_length(bytea *b, const char *fn_name) {
                 (errmsg("%s expected a float32-aligned bytea (got %zu bytes)",
                         fn_name, size)));
     return (int)(size / sizeof(float));
+}
+
+static inline bytea* bytea_constant_like(bytea *src, const char *fn_name, float value) {
+    int n = float_length(src, fn_name);
+    bytea *out = bytea_same_size(src);
+    float *dst = as_float(out);
+    for (int i = 0; i < n; i++)
+        dst[i] = value;
+    return out;
 }
 
 static inline void ensure_same_size(bytea *a, bytea *b, const char *fn_name) {
