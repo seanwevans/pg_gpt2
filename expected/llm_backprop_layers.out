@@ -1,0 +1,121 @@
+SET
+CREATE FUNCTION
+CREATE FUNCTION
+CREATE FUNCTION
+CREATE FUNCTION
+CREATE FUNCTION
+CREATE FUNCTION
+CREATE FUNCTION
+CREATE FUNCTION
+CREATE FUNCTION
+CREATE FUNCTION
+CREATE FUNCTION
+CREATE FUNCTION
+CREATE FUNCTION
+CREATE FUNCTION
+CREATE FUNCTION
+CREATE FUNCTION
+CREATE FUNCTION
+CREATE FUNCTION
+DROP TABLE
+CREATE TABLE
+DROP TABLE
+CREATE TABLE
+DROP TABLE
+CREATE TABLE
+DROP TABLE
+CREATE TABLE
+DELETE 0
+INSERT 0 1
+add backward
+TRUNCATE TABLE
+TRUNCATE TABLE
+TRUNCATE TABLE
+   label   | matches
+-----------+---------
+ input_1   | t
+ input_2   | t
+(2 rows)
+matmul backward
+TRUNCATE TABLE
+TRUNCATE TABLE
+TRUNCATE TABLE
+     label     | matches
+---------------+---------
+ dA matches    | t
+ dB matches    | t
+(2 rows)
+softmax backward
+TRUNCATE TABLE
+TRUNCATE TABLE
+TRUNCATE TABLE
+         label          | matches
+------------------------+---------
+ softmax grad matches   | t
+(1 row)
+cross entropy backward
+TRUNCATE TABLE
+TRUNCATE TABLE
+TRUNCATE TABLE
+            label             | matches
+-----------------------------+---------
+ cross entropy grad matches  | t
+(1 row)
+dropout backward
+TRUNCATE TABLE
+TRUNCATE TABLE
+TRUNCATE TABLE
+        label         | matches
+----------------------+---------
+ dropout grad matches | t
+(1 row)
+layernorm backward
+TRUNCATE TABLE
+TRUNCATE TABLE
+TRUNCATE TABLE
+      label       | matches
+------------------+---------
+ dx matches       | t
+ dgamma matches   | t
+ dbeta matches    | t
+(3 rows)
+attention backward
+TRUNCATE TABLE
+TRUNCATE TABLE
+TRUNCATE TABLE
+      label       | matches
+------------------+---------
+ dx matches       | t
+ dw_qkv matches   | t
+ db_qkv matches   | t
+ dw_o matches     | t
+ db_o matches     | t
+(5 rows)
+gelu backward
+TRUNCATE TABLE
+TRUNCATE TABLE
+TRUNCATE TABLE
+      label       | matches
+------------------+---------
+ gelu grad matches | t
+(1 row)
+transpose backward
+TRUNCATE TABLE
+TRUNCATE TABLE
+TRUNCATE TABLE
+         label          | matches
+------------------------+---------
+ transpose grad matches | t
+(1 row)
+mlp backward
+TRUNCATE TABLE
+TRUNCATE TABLE
+TRUNCATE TABLE
+      label       | matches
+------------------+---------
+ dx matches       | t
+ dw_fc matches    | t
+ db_fc matches    | t
+ dw_proj matches  | t
+ db_proj matches  | t
+(5 rows)

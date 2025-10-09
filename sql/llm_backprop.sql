@@ -3,6 +3,8 @@ RETURNS VOID AS $$
 DECLARE
     node RECORD;
     grad BYTEA;
+    a BYTEA;
+    b BYTEA;
     m INT; k INT; n INT;
     b_grad BYTEA;
     grad_rows BYTEA;
@@ -19,8 +21,11 @@ DECLARE
     attn_db_qkv BYTEA;
     attn_dw_o BYTEA;
     attn_db_o BYTEA;
-    ln_gamma_id INT;
-    ln_beta_id INT;
+    mlp_dx BYTEA;
+    mlp_dw_fc BYTEA;
+    mlp_db_fc BYTEA;
+    mlp_dw_proj BYTEA;
+    mlp_db_proj BYTEA;
 BEGIN
     -- seed gradient of final output = 1
     UPDATE llm_tensor_rt SET grad = pg_llm_ones_like(data) WHERE id=start_id;
@@ -131,41 +136,6 @@ BEGIN
             UPDATE llm_tensor_rt
               SET grad = COALESCE(grad, pg_llm_zeros_like(data)) + ln_dbeta
               WHERE id = node.inputs[3];
-        ELSIF node.name='attention' THEN
-            SELECT dx, dw_qkv, db_qkv, dw_o, db_o
-              INTO dx, dw_qkv, db_qkv, dw_o, db_o
-              FROM pg_llm_attention_backward(
-                  (SELECT data FROM llm_tensor_rt WHERE id=node.inputs[1]),
-                  (SELECT data FROM llm_tensor_rt WHERE id=node.inputs[2]),
-                  (SELECT data FROM llm_tensor_rt WHERE id=node.inputs[3]),
-                  (SELECT data FROM llm_tensor_rt WHERE id=node.inputs[4]),
-                  (SELECT data FROM llm_tensor_rt WHERE id=node.inputs[5]),
-                  (SELECT grad FROM llm_tensor_rt WHERE id=node.output),
-                  (node.extra->>'n_head')::INT,
-                  (node.extra->>'T')::INT,
-                  (node.extra->>'D')::INT)
-              AS t(dx BYTEA, dw_qkv BYTEA, db_qkv BYTEA, dw_o BYTEA, db_o BYTEA);
-
-            SELECT dx, dgamma, dbeta
-              INTO ln_dx, ln_dgamma, ln_dbeta
-              FROM pg_llm_layernorm_backward(
-                  (SELECT data FROM llm_tensor_rt WHERE id=node.inputs[1]),
-                  (SELECT grad FROM llm_tensor_rt WHERE id=node.output),
-                  (SELECT data FROM llm_tensor_rt WHERE id=ln_gamma_id),
-                  (node.extra->>'eps')::FLOAT4)
-              AS t(dx BYTEA, dgamma BYTEA, dbeta BYTEA);
-
-            UPDATE llm_tensor_rt
-              SET grad = COALESCE(grad, pg_llm_zeros_like(data)) + ln_dx
-              WHERE id = node.inputs[1];
-
-            UPDATE llm_tensor_rt
-              SET grad = COALESCE(grad, pg_llm_zeros_like(data)) + ln_dgamma
-              WHERE id = ln_gamma_id;
-
-            UPDATE llm_tensor_rt
-              SET grad = COALESCE(grad, pg_llm_zeros_like(data)) + ln_dbeta
-              WHERE id = ln_beta_id;
         ELSIF node.name='gelu' THEN
             UPDATE llm_tensor_rt
               SET grad = COALESCE(grad, pg_llm_zeros_like(data))
@@ -218,6 +188,39 @@ BEGIN
 
             UPDATE llm_tensor_rt
               SET grad = COALESCE(grad, pg_llm_zeros_like(data)) + attn_db_o
+              WHERE id = node.inputs[5];
+        ELSIF node.name='mlp' THEN
+            SELECT dx, dw_fc, db_fc, dw_proj, db_proj
+              INTO mlp_dx, mlp_dw_fc, mlp_db_fc, mlp_dw_proj, mlp_db_proj
+              FROM pg_llm_mlp_backward(
+                  (SELECT data FROM llm_tensor_rt WHERE id=node.inputs[1]),
+                  (SELECT data FROM llm_tensor_rt WHERE id=node.inputs[2]),
+                  (SELECT data FROM llm_tensor_rt WHERE id=node.inputs[3]),
+                  (SELECT data FROM llm_tensor_rt WHERE id=node.inputs[4]),
+                  (SELECT data FROM llm_tensor_rt WHERE id=node.inputs[5]),
+                  (SELECT grad FROM llm_tensor_rt WHERE id=node.output),
+                  (node.extra->>'T')::INT,
+                  (node.extra->>'D')::INT)
+              AS t(dx BYTEA, dw_fc BYTEA, db_fc BYTEA, dw_proj BYTEA, db_proj BYTEA);
+
+            UPDATE llm_tensor_rt
+              SET grad = COALESCE(grad, pg_llm_zeros_like(data)) + mlp_dx
+              WHERE id = node.inputs[1];
+
+            UPDATE llm_tensor_rt
+              SET grad = COALESCE(grad, pg_llm_zeros_like(data)) + mlp_dw_fc
+              WHERE id = node.inputs[2];
+
+            UPDATE llm_tensor_rt
+              SET grad = COALESCE(grad, pg_llm_zeros_like(data)) + mlp_db_fc
+              WHERE id = node.inputs[3];
+
+            UPDATE llm_tensor_rt
+              SET grad = COALESCE(grad, pg_llm_zeros_like(data)) + mlp_dw_proj
+              WHERE id = node.inputs[4];
+
+            UPDATE llm_tensor_rt
+              SET grad = COALESCE(grad, pg_llm_zeros_like(data)) + mlp_db_proj
               WHERE id = node.inputs[5];
         -- Similar for layernorm, softmax, cross_entropy etc.
         END IF;
