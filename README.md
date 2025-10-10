@@ -27,6 +27,14 @@ If PostgreSQL is installed somewhere custom, set the `PG_CONFIG` environment var
 
 ---
 
+## Getting Started
+
+1. **Compile and install the extension.** From the repository root run `make install`. The build uses PGXS and will copy `pg_llm` artifacts into PostgreSQL's extension directory reported by `pg_config --pkglibdir`.
+2. **Load the extension in a database.** Connect with `psql` and execute `CREATE EXTENSION pg_llm;` in the target database. This initializes all required tables, functions, and SQL entry points.
+3. **Verify availability.** Confirm the extension is active with either `\dx pg_llm` in `psql` or a query such as `SELECT * FROM pg_extension WHERE extname = 'pg_llm';`. Successful output indicates the extension is ready for the workflow described below.
+
+---
+
 ## Core Design Principles
 
 1. **Postgres as OS** — All computation and persistence live in SQL schemas and C extensions.
