@@ -243,7 +243,9 @@ python scripts/prepare_dataset.py \
 ```
 
 An end-to-end walkthrough that stitches the helper scripts together is available
-in [docs/python_workflow.md](docs/python_workflow.md).
+in [docs/python_workflow.md](docs/python_workflow.md), and a fully annotated
+Jupyter notebook showing the SQL fine-tuning loop from data ingestion through
+generation lives at [docs/fine_tuning_workflow.ipynb](docs/fine_tuning_workflow.ipynb).
 
 ---
 
