@@ -22,6 +22,11 @@ The resulting file can be imported into PostgreSQL via:
 SELECT pg_llm_import_npz('/mnt/models/gpt2-small.npz', 'gpt2-small');
 ```
 
+During import the extension verifies the checkpoint tensors against the
+dimensions recorded in `llm_model_config`. The default installation registers
+the GPT-2 small architecture; insert a row into that table for custom models
+before invoking `pg_llm_import_npz` so the validation can run.
+
 ## 2. Ingest Tokenizer Vocabulary
 
 With the weights in place, load the GPT-2 tokenizer vocabulary and merge rules
