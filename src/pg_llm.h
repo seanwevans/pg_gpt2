@@ -40,6 +40,13 @@ extern Datum pg_llm_autograd_map_param(PG_FUNCTION_ARGS);
 /* Optimized kernels */
 extern void pg_llm_fast_gemm(const float *A, const float *B, float *C,
                              int M, int K, int N);
+extern void pg_llm_vector_add(const float *a, const float *b, float *out, int n);
+extern void pg_llm_layernorm_forward(const float *x,
+                                     const float *gamma,
+                                     const float *beta,
+                                     int n,
+                                     float eps,
+                                     float *y);
 
 /* Utility helpers */
 static inline float* as_float(bytea *b) {

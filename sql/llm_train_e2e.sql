@@ -2,6 +2,17 @@
 SET client_min_messages = warning;
 SET extra_float_digits = 3;
 
+TRUNCATE llm_param,
+         llm_param_share,
+         llm_dataset,
+         llm_train_log,
+         llm_tensor,
+         llm_tensor_rt,
+         llm_tensor_map,
+         llm_tape;
+
+COPY (SELECT 1) TO PROGRAM 'mkdir -p /mnt/checkpoints';
+
 -- Deterministic helpers for zero and uniform random tensors.
 CREATE OR REPLACE FUNCTION llm_tensor_zeros(len int)
 RETURNS bytea
@@ -181,7 +192,7 @@ $$;
 
 CALL tiny_e2e_prepare(0.123456);
 
-SELECT llm_train('tiny_e2e', 10, 2, 4, 64, 32,
+SELECT llm_train('tiny_e2e', 5, 2, 4, 64, 32,
                  dropout_p => 0.0,
                  beta1 => 0.9,
                  beta2 => 0.999,
@@ -190,6 +201,94 @@ SELECT llm_train('tiny_e2e', 10, 2, 4, 64, 32,
                  lr_max => 0.01,
                  warmup => 2,
                  grad_clip => NULL);
+
+DO $$
+DECLARE
+    checkpoint_id INT;
+    checkpoint_path TEXT;
+    original bytea;
+    mutated bytea;
+    restored bytea;
+BEGIN
+    PERFORM llm_checkpoint_save('tiny_e2e', 'after 5 steps');
+
+    SELECT id, file_path
+      INTO checkpoint_id, checkpoint_path
+      FROM llm_checkpoint
+     WHERE model = 'tiny_e2e'
+     ORDER BY id DESC
+     LIMIT 1;
+
+    IF checkpoint_id IS NULL THEN
+        RAISE EXCEPTION 'checkpoint metadata missing for model %', 'tiny_e2e';
+    END IF;
+
+    PERFORM pg_stat_file(checkpoint_path);
+
+    SELECT data
+      INTO original
+      FROM llm_param
+     WHERE model = 'tiny_e2e'
+       AND name = 'wte'
+       AND token_id = 0;
+
+    IF original IS NULL THEN
+        RAISE EXCEPTION 'expected baseline parameter for model %', 'tiny_e2e';
+    END IF;
+
+    UPDATE llm_param
+       SET data = llm_tensor_fill(64, 42.0)
+     WHERE model = 'tiny_e2e'
+       AND name = 'wte'
+       AND token_id = 0;
+
+    SELECT data
+      INTO mutated
+      FROM llm_param
+     WHERE model = 'tiny_e2e'
+       AND name = 'wte'
+       AND token_id = 0;
+
+    IF mutated = original THEN
+        RAISE EXCEPTION 'parameter mutation failed to change value';
+    END IF;
+
+    PERFORM llm_checkpoint_load('tiny_e2e', checkpoint_id);
+
+    SELECT data
+      INTO restored
+      FROM llm_param
+     WHERE model = 'tiny_e2e'
+       AND name = 'wte'
+       AND token_id = 0;
+
+    IF restored IS DISTINCT FROM original THEN
+        RAISE EXCEPTION 'restored parameter does not match checkpointed value';
+    END IF;
+
+    IF (SELECT MAX(step)
+          FROM llm_param
+         WHERE model = 'tiny_e2e') <> 5 THEN
+        RAISE EXCEPTION 'unexpected optimizer step metadata after restore';
+    END IF;
+END;
+$$;
+
+SELECT llm_train('tiny_e2e', 5, 2, 4, 64, 32,
+                 dropout_p => 0.0,
+                 beta1 => 0.9,
+                 beta2 => 0.999,
+                 eps => 1e-8,
+                 wd => 0.01,
+                 lr_max => 0.01,
+                 warmup => 2,
+                 grad_clip => NULL);
+
+SELECT COUNT(*) AS total_steps,
+       MIN(step) AS min_step,
+       MAX(step) AS max_step
+  FROM llm_train_log
+ WHERE model = 'tiny_e2e';
 
 DO $$
 DECLARE

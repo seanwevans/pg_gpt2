@@ -1,0 +1,16 @@
+SET
+TRUNCATE TABLE
+INSERT 0 2
+INSERT 0 2048
+INSERT 0 1
+ token_count 
+-------------
+        2048
+(1 row)
+
+ embed_bytes 
+-------------
+        8192
+(1 row)
+
+TRUNCATE TABLE

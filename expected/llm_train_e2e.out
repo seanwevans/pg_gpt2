@@ -20,7 +20,19 @@ SELECT 10
 CALL
  llm_train 
 -----------
- 
+
+(1 row)
+
+DO
+
+ llm_train
+-----------
+
+(1 row)
+
+ total_steps | min_step | max_step
+-------------+----------+----------
+          10 |        1 |       10
 (1 row)
 
 DO
