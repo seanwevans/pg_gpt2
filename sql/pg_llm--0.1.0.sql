@@ -145,6 +145,24 @@ INSERT INTO llm_model_config(model, n_layer, n_head, d_model, n_positions, vocab
 VALUES ('gpt2-small', 12, 12, 768, 1024, 50257)
 ON CONFLICT (model) DO NOTHING;
 
+CREATE OR REPLACE FUNCTION llm_get_model_config(p_model TEXT)
+RETURNS llm_model_config AS $$
+DECLARE
+    cfg llm_model_config%ROWTYPE;
+BEGIN
+    SELECT * INTO cfg
+      FROM llm_model_config
+     WHERE model = p_model;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Missing llm_model_config entry for model %', p_model
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+
+    RETURN cfg;
+END;
+$$ LANGUAGE plpgsql STABLE;
+
 CREATE TABLE llm_param (
     model TEXT,
     name TEXT,
@@ -719,10 +737,10 @@ $$ LANGUAGE plpgsql;
 CREATE OR REPLACE FUNCTION llm_train(
     model TEXT,
     n_steps INT,
-    n_layer INT,
-    n_head INT,
-    D INT,
-    vocab INT,
+    n_layer INT DEFAULT NULL,
+    n_head INT DEFAULT NULL,
+    D INT DEFAULT NULL,
+    vocab INT DEFAULT NULL,
     dropout_p FLOAT4 DEFAULT 0.1,
     beta1 FLOAT4 DEFAULT 0.9,
     beta2 FLOAT4 DEFAULT 0.999,
@@ -740,7 +758,27 @@ DECLARE
     dataset_size INT;
     idx INT := 1;
     batch_id INT;
+    cfg llm_model_config%ROWTYPE;
+    effective_n_layer INT := n_layer;
+    effective_n_head INT := n_head;
+    effective_d INT := D;
+    effective_vocab INT := vocab;
 BEGIN
+    IF effective_n_layer IS NULL OR effective_n_head IS NULL
+       OR effective_d IS NULL OR effective_vocab IS NULL THEN
+        cfg := llm_get_model_config(model);
+        effective_n_layer := COALESCE(effective_n_layer, cfg.n_layer);
+        effective_n_head := COALESCE(effective_n_head, cfg.n_head);
+        effective_d := COALESCE(effective_d, cfg.d_model);
+        effective_vocab := COALESCE(effective_vocab, cfg.vocab);
+    END IF;
+
+    IF effective_n_layer IS NULL OR effective_n_head IS NULL
+       OR effective_d IS NULL OR effective_vocab IS NULL THEN
+        RAISE EXCEPTION 'Missing model configuration parameters for %', model
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+
     SELECT array_agg(id ORDER BY random()) INTO dataset_ids FROM llm_dataset;
     dataset_size := COALESCE(array_length(dataset_ids, 1), 0);
 
@@ -763,7 +801,7 @@ BEGIN
 
         loss := llm_train_step(
             model, batch_id,
-            n_layer, n_head, D, vocab,
+            effective_n_layer, effective_n_head, effective_d, effective_vocab,
             dropout_p,
             beta1, beta2, eps, wd,
             lr_max, warmup, n_steps,
@@ -954,7 +992,14 @@ BEGIN;
 
   -- Forward pass with autograd enabled
   INSERT INTO llm_autograd_mode VALUES(true);
-  PERFORM llm_loss('gpt2-small', seq, target, 12, 12, 768, 50257);
+  PERFORM llm_loss(
+      'gpt2-small',
+      seq,
+      target,
+      (SELECT n_layer FROM llm_model_config WHERE model = 'gpt2-small'),
+      (SELECT n_head FROM llm_model_config WHERE model = 'gpt2-small'),
+      (SELECT d_model FROM llm_model_config WHERE model = 'gpt2-small'),
+      (SELECT vocab FROM llm_model_config WHERE model = 'gpt2-small'));
 
   -- Reverse pass
   PERFORM llm_backprop((SELECT MAX(id) FROM llm_tape), 'gpt2-small');
@@ -1101,8 +1146,8 @@ $$ LANGUAGE plpgsql;
 CREATE OR REPLACE FUNCTION llm_logits(
     token_ids INT[],
     model_name TEXT DEFAULT 'gpt2-small',
-    n_layer INT DEFAULT 12,
-    n_head INT DEFAULT 12,
+    n_layer INT DEFAULT NULL,
+    n_head INT DEFAULT NULL,
     d_model INT DEFAULT NULL,
     vocab_size INT DEFAULT NULL)
 RETURNS BYTEA AS $$
@@ -1110,14 +1155,28 @@ DECLARE
     seq_len INT := COALESCE(array_length(token_ids, 1), 0);
     x BYTEA;
     weight_matrix BYTEA;
+    cfg llm_model_config%ROWTYPE;
+    effective_n_layer INT := n_layer;
+    effective_n_head INT := n_head;
+    effective_d_model INT := d_model;
+    effective_vocab INT := vocab_size;
 BEGIN
     IF seq_len = 0 THEN
         RETURN ''::BYTEA;
     END IF;
 
-    IF d_model IS NULL THEN
+    IF effective_n_layer IS NULL OR effective_n_head IS NULL
+       OR effective_d_model IS NULL OR effective_vocab IS NULL THEN
+        cfg := llm_get_model_config(model_name);
+        effective_n_layer := COALESCE(effective_n_layer, cfg.n_layer);
+        effective_n_head := COALESCE(effective_n_head, cfg.n_head);
+        effective_d_model := COALESCE(effective_d_model, cfg.d_model);
+        effective_vocab := COALESCE(effective_vocab, cfg.vocab);
+    END IF;
+
+    IF effective_d_model IS NULL THEN
         SELECT octet_length(p.data) / 4
-          INTO d_model
+          INTO effective_d_model
           FROM llm_param_resolved p
          WHERE p.model = model_name
            AND p.name = 'wte'
@@ -1125,27 +1184,27 @@ BEGIN
          LIMIT 1;
     END IF;
 
-    IF d_model IS NULL THEN
+    IF effective_d_model IS NULL THEN
         RAISE EXCEPTION 'Missing token embeddings for model %', model_name;
     END IF;
 
-    IF vocab_size IS NULL THEN
+    IF effective_vocab IS NULL THEN
         SELECT COUNT(*)
-          INTO vocab_size
+          INTO effective_vocab
           FROM llm_param_resolved p
          WHERE p.model = model_name
            AND p.name = 'wte';
     END IF;
 
-    x := llm_embed(token_ids, model_name, d_model);
+    x := llm_embed(token_ids, model_name, effective_d_model);
 
     x := llm_forward_gpt2(
         x,
         model_name,
-        n_layer,
-        n_head,
+        effective_n_layer,
+        effective_n_head,
         seq_len,
-        d_model,
+        effective_d_model,
         dropout_p => 0.0::float4,
         training => false);
 
@@ -1159,7 +1218,7 @@ BEGIN
         RAISE EXCEPTION 'Missing token embeddings for model %', model_name;
     END IF;
 
-    RETURN pg_llm_matmul(x, weight_matrix, seq_len, d_model, vocab_size);
+    RETURN pg_llm_matmul(x, weight_matrix, seq_len, effective_d_model, effective_vocab);
 END;
 $$ LANGUAGE plpgsql;
 

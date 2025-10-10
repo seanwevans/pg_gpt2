@@ -81,8 +81,22 @@ pip install transformers torch psycopg[binary]
 With the tables populated you can now train directly in SQL, for example:
 
 ```sql
-SELECT llm_train('gpt2-small', 1000, 12, 12, 768, 50257, 0.9, 0.999, 1e-8, 0.01, 2.5e-4, 2000);
+SELECT llm_train(
+    'gpt2-small',
+    1000,
+    beta1 => 0.9,
+    beta2 => 0.999,
+    eps => 1e-8,
+    wd => 0.01,
+    lr_max => 2.5e-4,
+    warmup => 2000
+);
 ```
+
+The layer count, head count, hidden size, and vocabulary size are inferred from
+`llm_model_config`. Override them by supplying explicit values for the optional
+architecture arguments (`n_layer`, `n_head`, `D`, `vocab`) if you are
+experimenting with custom checkpoints.
 
 ## Client-Side Generation Helpers
 
