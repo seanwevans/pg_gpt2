@@ -166,10 +166,8 @@ CREATE TABLE llm_train_log (
 
 CREATE UNLOGGED TABLE llm_dataset (
     id SERIAL PRIMARY KEY,
-    tokens INT[],          -- 1024-token sequence
+    tokens INT[],          -- token sequence
     target INT[],          -- shifted targets
-    CHECK (array_length(tokens, 1) IS NULL OR array_length(tokens, 1) <= 1024),
-    CHECK (array_length(target, 1) IS NULL OR array_length(target, 1) <= 1024),
     CHECK ((array_length(tokens, 1) IS NULL AND array_length(target, 1) IS NULL)
            OR array_length(tokens, 1) = array_length(target, 1))
 );
@@ -323,10 +321,6 @@ BEGIN
 
     IF seq_len = 0 THEN
         RETURN ''::BYTEA;
-    END IF;
-
-    IF seq_len > 1024 THEN
-        RAISE EXCEPTION 'Sequence length % exceeds GPT-2 maximum of 1024 positions', seq_len;
     END IF;
 
     -- Flatten summed token and positional embeddings
