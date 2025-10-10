@@ -154,10 +154,7 @@ SELECT * FROM llm_generate_stream('Once upon a time', 40, 0.8, 40, 0.95);
 -- Train for 10,000 steps on tokenized text dataset
 SELECT llm_train(
   'gpt2-small',
-  10000,        -- steps
-  12, 12, 768,  -- layers, heads, hidden size
-  50257,        -- vocab size
-  0.9, 0.999, 1e-8, 0.01, 2.5e-4, 2000
+  10000,
   grad_workers => 4,
   prune_workers => 4
 );
@@ -169,6 +166,11 @@ Every step performs:
 3. Gradient accumulation
 4. AdamW parameter updates
 5. Logging to `llm_train_log`
+
+`llm_train` will automatically read the layer count, attention heads, hidden size,
+and vocabulary size from `llm_model_config`. Provide overrides for custom
+experiments by passing explicit values for `n_layer`, `n_head`, `D`, or `vocab`
+when invoking the function.
 
 The training helpers expose knobs for multi-core cleanup work:
 
@@ -302,7 +304,7 @@ SELECT llm_encode('The database that dreamed of language.','gpt2-small');
 SELECT llm_generate('The database that dreamed of language', 40, 0.8, 40, 0.95);
 
 -- 4. Train or fine-tune
-SELECT llm_train('gpt2-small', 5000, 12, 12, 768, 50257);
+SELECT llm_train('gpt2-small', 5000);
 
 -- 5. Save checkpoint
 SELECT llm_checkpoint_save('gpt2-small','finetuned on corpus X');
