@@ -74,6 +74,12 @@ If PostgreSQL is installed somewhere custom, set the `PG_CONFIG` environment var
 
 ---
 
+## Roadmap
+
+See [docs/roadmap.md](docs/roadmap.md) for the upcoming feature roadmap, including GPT-3 style architecture support, mixed-precision execution, and hardware acceleration milestones.
+
+---
+
 ## Autograd Workflow
 
 End-to-end training relies on a thin runtime that records every forward op in SQL
