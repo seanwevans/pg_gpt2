@@ -33,6 +33,20 @@ If PostgreSQL is installed somewhere custom, set the `PG_CONFIG` environment var
 2. **Load the extension in a database.** Connect with `psql` and execute `CREATE EXTENSION pg_llm;` in the target database. This initializes all required tables, functions, and SQL entry points.
 3. **Verify availability.** Confirm the extension is active with either `\dx pg_llm` in `psql` or a query such as `SELECT * FROM pg_extension WHERE extname = 'pg_llm';`. Successful output indicates the extension is ready for the workflow described below.
 
+### Docker Image
+
+To simplify evaluation and demos you can run PostgreSQL with the `pg_gpt2` extension pre-installed using the provided Dockerfile.
+
+```bash
+# Build the image locally
+docker build -t pg-gpt2-demo .
+
+# Start PostgreSQL with pg_llm already installed in the default database
+docker run --rm -e POSTGRES_PASSWORD=secret -p 5432:5432 --name pg-gpt2 pg-gpt2-demo
+```
+
+The container reuses the official `postgres:16` entrypoint. On first start it creates the default database and automatically enables the `pg_llm` extension so that `psql` connections can immediately run the SQL workflows described below.
+
 ---
 
 ## Core Design Principles
