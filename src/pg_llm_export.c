@@ -105,10 +105,11 @@ pg_llm_export_npz(PG_FUNCTION_ARGS)
 
         pfree(DatumGetPointer(model_value));
 
-        if (gzclose(fp) != Z_OK)
+        int gz_rc = gzclose(fp);
+        fp = NULL;
+        if (gz_rc != Z_OK)
             ereport(ERROR,
                     (errmsg("gzclose failed while exporting %s", path)));
-        fp = NULL;
 
         SPI_finish();
     }

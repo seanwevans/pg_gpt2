@@ -122,10 +122,11 @@ Datum pg_llm_import_npz(PG_FUNCTION_ARGS)
             free_npy_header(&hdr);
         }
 
-        if (gzclose(fp) != Z_OK)
+        int gz_rc = gzclose(fp);
+        fp = NULL;
+        if (gz_rc != Z_OK)
             ereport(ERROR,
                     (errmsg("gzclose failed while importing %s", path)));
-        fp = NULL;
         SPI_finish();
     }
     PG_CATCH();
