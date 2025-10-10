@@ -93,7 +93,7 @@ BEGIN
         SELECT data INTO w_qkv FROM llm_tensor WHERE name = format('h.%s.attn.c_attn.weight', i);
         SELECT data INTO b_qkv FROM llm_tensor WHERE name = format('h.%s.attn.c_attn.bias', i);
         IF b_qkv IS NULL THEN
-            SELECT data INTO b_qkv FROM llm_param WHERE name = format('h.%s.attn.c_attn.bias', i) AND token_id = 0 LIMIT 1;
+            SELECT data INTO b_qkv FROM llm_param_resolved WHERE name = format('h.%s.attn.c_attn.bias', i) AND token_id = 0 LIMIT 1;
         END IF;
         IF b_qkv IS NULL THEN
             RAISE EXCEPTION 'Missing attention qkv bias for layer %', i;
@@ -101,7 +101,7 @@ BEGIN
         SELECT data INTO w_o FROM llm_tensor WHERE name = format('h.%s.attn.c_proj.weight', i);
         SELECT data INTO b_o FROM llm_tensor WHERE name = format('h.%s.attn.c_proj.bias', i);
         IF b_o IS NULL THEN
-            SELECT data INTO b_o FROM llm_param WHERE name = format('h.%s.attn.c_proj.bias', i) AND token_id = 0 LIMIT 1;
+            SELECT data INTO b_o FROM llm_param_resolved WHERE name = format('h.%s.attn.c_proj.bias', i) AND token_id = 0 LIMIT 1;
         END IF;
         IF b_o IS NULL THEN
             RAISE EXCEPTION 'Missing attention proj bias for layer %', i;
@@ -185,7 +185,7 @@ BEGIN
 
     IF final_weight IS NULL THEN
         SELECT data INTO final_weight
-        FROM llm_param
+        FROM llm_param_resolved
         WHERE name = 'ln_f.weight'
           AND token_id = 0
         LIMIT 1;
@@ -200,7 +200,7 @@ BEGIN
 
     IF final_bias IS NULL THEN
         SELECT data INTO final_bias
-        FROM llm_param
+        FROM llm_param_resolved
         WHERE name = 'ln_f.bias'
           AND token_id = 0
         LIMIT 1;

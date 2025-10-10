@@ -157,6 +157,127 @@ CREATE TABLE llm_param (
     PRIMARY KEY (model, name, token_id)
 );
 
+-- Mapping for parameters that share weights with another model.
+CREATE TABLE llm_param_share (
+    source_model TEXT NOT NULL,
+    source_name TEXT NOT NULL,
+    source_token_id INT DEFAULT 0 NOT NULL,
+    target_model TEXT NOT NULL,
+    target_name TEXT NOT NULL,
+    target_token_id INT DEFAULT 0 NOT NULL,
+    PRIMARY KEY (target_model, target_name, target_token_id)
+);
+
+-- Helper view that resolves shared parameters to their underlying storage.
+CREATE OR REPLACE VIEW llm_param_resolved AS
+    SELECT model, name, token_id, data, grad, m, v, step
+      FROM llm_param
+    UNION ALL
+    SELECT s.target_model AS model,
+           s.target_name AS name,
+           s.target_token_id AS token_id,
+           p.data,
+           p.grad,
+           p.m,
+           p.v,
+           p.step
+      FROM llm_param_share s
+      JOIN llm_param p
+        ON p.model = s.source_model
+       AND p.name = s.source_name
+       AND p.token_id = s.source_token_id;
+
+CREATE OR REPLACE FUNCTION llm_share_param(
+    source_model TEXT,
+    source_name TEXT,
+    source_token_id INT DEFAULT 0,
+    target_model TEXT,
+    target_name TEXT DEFAULT NULL,
+    target_token_id INT DEFAULT NULL)
+RETURNS VOID AS $$
+DECLARE
+    dest_name TEXT := COALESCE(target_name, source_name);
+    dest_token INT := COALESCE(target_token_id, source_token_id);
+BEGIN
+    PERFORM 1
+      FROM llm_param
+     WHERE model = source_model
+       AND name = source_name
+       AND token_id = source_token_id;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'cannot share parameter %.%[%] because it does not exist',
+            source_model, source_name, source_token_id;
+    END IF;
+
+    DELETE FROM llm_param
+     WHERE model = target_model
+       AND name = dest_name
+       AND token_id = dest_token;
+
+    INSERT INTO llm_param_share(
+        source_model, source_name, source_token_id,
+        target_model, target_name, target_token_id)
+    VALUES (source_model, source_name, source_token_id,
+            target_model, dest_name, dest_token)
+    ON CONFLICT (target_model, target_name, target_token_id)
+    DO UPDATE SET source_model = EXCLUDED.source_model,
+                  source_name = EXCLUDED.source_name,
+                  source_token_id = EXCLUDED.source_token_id;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION llm_unshare_param(
+    target_model TEXT,
+    target_name TEXT,
+    target_token_id INT DEFAULT 0,
+    copy_optimizer_state BOOLEAN DEFAULT true)
+RETURNS VOID AS $$
+DECLARE
+    share_rec RECORD;
+BEGIN
+    SELECT *
+      INTO share_rec
+      FROM llm_param_share
+     WHERE target_model = llm_unshare_param.target_model
+       AND target_name = llm_unshare_param.target_name
+       AND target_token_id = llm_unshare_param.target_token_id;
+
+    IF NOT FOUND THEN
+        DELETE FROM llm_param_share
+         WHERE target_model = llm_unshare_param.target_model
+           AND target_name = llm_unshare_param.target_name
+           AND target_token_id = llm_unshare_param.target_token_id;
+        RETURN;
+    END IF;
+
+    DELETE FROM llm_param_share
+     WHERE target_model = share_rec.target_model
+       AND target_name = share_rec.target_name
+       AND target_token_id = share_rec.target_token_id;
+
+    INSERT INTO llm_param(model, name, token_id, data, grad, m, v, step)
+    SELECT share_rec.target_model,
+           share_rec.target_name,
+           share_rec.target_token_id,
+           p.data,
+           NULL,
+           CASE WHEN copy_optimizer_state THEN p.m ELSE NULL::BYTEA END,
+           CASE WHEN copy_optimizer_state THEN p.v ELSE NULL::BYTEA END,
+           CASE WHEN copy_optimizer_state THEN p.step ELSE 0 END
+      FROM llm_param p
+     WHERE p.model = share_rec.source_model
+       AND p.name = share_rec.source_name
+       AND p.token_id = share_rec.source_token_id
+    ON CONFLICT (model, name, token_id) DO UPDATE
+        SET data = EXCLUDED.data,
+            grad = NULL,
+            m = EXCLUDED.m,
+            v = EXCLUDED.v,
+            step = EXCLUDED.step;
+END;
+$$ LANGUAGE plpgsql;
+
 -- Materialized tensors used during the forward pass (activations, cached weights)
 CREATE UNLOGGED TABLE llm_tensor (
     id SERIAL PRIMARY KEY,
@@ -216,8 +337,8 @@ BEGIN
         n_head,
         array_length(tokens,1),
         D,
-        (SELECT data FROM llm_param p WHERE p.model = model AND p.name = 'ln_f.weight'),
-        (SELECT data FROM llm_param p WHERE p.model = model AND p.name = 'ln_f.bias'),
+        (SELECT data FROM llm_param_resolved p WHERE p.model = model AND p.name = 'ln_f.weight'),
+        (SELECT data FROM llm_param_resolved p WHERE p.model = model AND p.name = 'ln_f.bias'),
         dropout_p => dropout_p,
         training => training);
 
@@ -227,7 +348,7 @@ BEGIN
     --    logits gradient is accumulated back into each `wte` row.
     logits := pg_llm_matmul(x,
         (SELECT string_agg(p.data::TEXT, '' ORDER BY p.token_id)::BYTEA
-         FROM llm_param p
+         FROM llm_param_resolved p
          WHERE p.model = model AND p.name = 'wte'),
         array_length(tokens,1), D, vocab);
 
@@ -275,8 +396,8 @@ BEGIN
     END IF;
 
     SELECT COALESCE(MAX(step), 0) + 1 INTO step_count
-    FROM llm_param
-    WHERE llm_param.model = model;
+    FROM llm_param_resolved
+    WHERE model = llm_train_step.model;
 
     lr := pg_llm_lr_schedule(step_count, warmup, total_steps, lr_max);
     -- Reset autograd state from the previous step
@@ -302,20 +423,28 @@ BEGIN
     PERFORM llm_backprop(tape_top, model);
     PERFORM llm_accumulate_grads(model);
 
-    UPDATE llm_param
+    UPDATE llm_param p
     SET (data, m, v, grad, step) = (
         SELECT s.weight, s.m, s.v, NULL::BYTEA, step_count
         FROM pg_llm_adamw_step(
-            data,
+            p.data,
             CASE
-                WHEN grad IS NULL OR grad_clip IS NULL OR grad_clip <= 0 THEN grad
-                ELSE pg_llm_grad_clip(grad, grad_clip)
+                WHEN p.grad IS NULL OR grad_clip IS NULL OR grad_clip <= 0 THEN p.grad
+                ELSE pg_llm_grad_clip(p.grad, grad_clip)
             END,
-            m, v,
+            p.m, p.v,
             lr, beta1, beta2, eps, wd, step_count
         ) AS s
     )
-    WHERE llm_param.model = model;
+    WHERE p.model = model
+       OR EXISTS (
+            SELECT 1
+              FROM llm_param_share s
+             WHERE s.target_model = model
+               AND s.source_model = p.model
+               AND s.source_name = p.name
+               AND s.source_token_id = p.token_id
+        );
 
     INSERT INTO llm_train_log(model, step, lr, loss)
     VALUES(model, step_count, lr, loss);
@@ -351,11 +480,11 @@ BEGIN
            )::BYTEA
       INTO out
       FROM unnest(tokens) WITH ORDINALITY AS t(token_id, ord)
-      JOIN llm_param wte
+      JOIN llm_param_resolved wte
         ON wte.model = model
        AND wte.name = 'wte'
        AND wte.token_id = t.token_id
-      JOIN llm_param wpe
+      JOIN llm_param_resolved wpe
         ON wpe.model = model
        AND wpe.name = 'wpe'
        AND wpe.token_id = t.ord - 1;
@@ -471,6 +600,7 @@ RETURNS VOID AS $$
 DECLARE
     rec RECORD;
     tensor_name TEXT;
+    tensor_id INT;
 BEGIN
     -- Clear cached tensors for this step
     DELETE FROM llm_tensor;
@@ -479,8 +609,21 @@ BEGIN
     -- Copy parameters into the tensor cache and create runtime tensors
     FOR rec IN
         SELECT name, token_id, data
-        FROM llm_param
-        WHERE model = p_model
+        FROM (
+            SELECT p.name, p.token_id, p.data
+            FROM llm_param p
+            WHERE p.model = p_model
+            UNION ALL
+            SELECT s.target_name AS name,
+                   s.target_token_id AS token_id,
+                   src.data
+            FROM llm_param_share s
+            JOIN llm_param src
+              ON src.model = s.source_model
+             AND src.name = s.source_name
+             AND src.token_id = s.source_token_id
+            WHERE s.target_model = p_model
+        ) params
     LOOP
         tensor_name := CASE
                            WHEN rec.token_id = 0 THEN rec.name
@@ -520,9 +663,17 @@ CREATE OR REPLACE FUNCTION llm_accumulate_grads(p_model TEXT)
 RETURNS VOID AS $$
 BEGIN
     -- Clear stale gradients for this model
-    UPDATE llm_param
+    UPDATE llm_param p
     SET grad = NULL
-    WHERE model = p_model;
+    WHERE p.model = p_model
+       OR EXISTS (
+            SELECT 1
+              FROM llm_param_share s
+             WHERE s.target_model = p_model
+               AND s.source_model = p.model
+               AND s.source_name = p.name
+               AND s.source_token_id = p.token_id
+        );
 
     -- Populate grads from runtime tensors recorded during autograd
     UPDATE llm_param p
@@ -533,6 +684,20 @@ BEGIN
       AND p.model = m.model
       AND p.name = m.name
       AND p.token_id = m.token_id
+      AND t.grad IS NOT NULL;
+
+    UPDATE llm_param p
+    SET grad = t.grad
+    FROM llm_param_share s
+    JOIN llm_tensor_map m
+      ON m.model = s.target_model
+     AND m.name = s.target_name
+     AND m.token_id = s.target_token_id
+    JOIN llm_tensor_rt t ON t.id = m.tensor_id
+    WHERE s.target_model = p_model
+      AND p.model = s.source_model
+      AND p.name = s.source_name
+      AND p.token_id = s.source_token_id
       AND t.grad IS NOT NULL;
 END;
 $$ LANGUAGE plpgsql;
@@ -593,13 +758,13 @@ CREATE OR REPLACE FUNCTION llm_checkpoint_save(model TEXT, note TEXT)
 RETURNS VOID AS $$
 DECLARE
     path TEXT := format('/mnt/checkpoints/%s-step%s.npz', model,
-                        (SELECT MAX(step) FROM llm_param WHERE model=model));
+                        (SELECT MAX(step) FROM llm_param_resolved WHERE model=model));
     n BIGINT;
 BEGIN
     PERFORM pg_llm_export_npz(path, model);
-    SELECT COUNT(*) INTO n FROM llm_param WHERE model=model;
+    SELECT COUNT(*) INTO n FROM llm_param_resolved WHERE model=model;
     INSERT INTO llm_checkpoint(model,step,n_params,file_path,note)
-    VALUES(model,(SELECT MAX(step) FROM llm_param WHERE model=model),
+    VALUES(model,(SELECT MAX(step) FROM llm_param_resolved WHERE model=model),
            n,path,note);
 END;
 $$ LANGUAGE plpgsql;
@@ -707,7 +872,7 @@ BEGIN
     IF d_model IS NULL THEN
         SELECT octet_length(p.data) / 4
           INTO d_model
-          FROM llm_param p
+          FROM llm_param_resolved p
          WHERE p.model = model_name
            AND p.name = 'wte'
          ORDER BY p.token_id
@@ -721,7 +886,7 @@ BEGIN
     IF vocab_size IS NULL THEN
         SELECT COUNT(*)
           INTO vocab_size
-          FROM llm_param p
+          FROM llm_param_resolved p
          WHERE p.model = model_name
            AND p.name = 'wte';
     END IF;
@@ -740,7 +905,7 @@ BEGIN
 
     SELECT string_agg(p.data::TEXT, '' ORDER BY p.token_id)::BYTEA
       INTO weight_matrix
-      FROM llm_param p
+      FROM llm_param_resolved p
      WHERE p.model = model_name
        AND p.name = 'wte';
 

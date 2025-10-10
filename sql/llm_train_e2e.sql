@@ -3,6 +3,7 @@ SET client_min_messages = warning;
 SET extra_float_digits = 3;
 
 TRUNCATE llm_param,
+         llm_param_share,
          llm_dataset,
          llm_train_log,
          llm_tensor,
