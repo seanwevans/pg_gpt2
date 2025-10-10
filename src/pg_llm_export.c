@@ -39,7 +39,7 @@ pg_llm_export_npz(PG_FUNCTION_ARGS)
 
         spi_rc = SPI_execute_with_args(
             "SELECT p.name, p.data, t.shape "
-            "FROM llm_param p "
+            "FROM llm_param_resolved p "
             "LEFT JOIN llm_tensor_map m ON (m.model = p.model AND m.name = p.name AND m.token_id = p.token_id) "
             "LEFT JOIN llm_tensor_rt t ON (t.id = m.tensor_id) "
             "WHERE p.model = $1 "
