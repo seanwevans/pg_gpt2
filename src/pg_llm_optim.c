@@ -1,4 +1,5 @@
 #include "pg_llm.h"
+#include <limits.h>
 
 /* ----------------------------------------------------------
  *  AdamW: parameter update
@@ -24,7 +25,11 @@ Datum pg_llm_adamw_step(PG_FUNCTION_ARGS)
     float  wd   = PG_GETARG_FLOAT4(8);
     int    t    = PG_GETARG_INT32(9);
 
-    int n = (int)(nbytes(w_b) / sizeof(float));
+    Size  w_bytes = nbytes(w_b);
+    Size  g_bytes = nbytes(g_b);
+    Size  m_bytes = nbytes(m_b);
+    Size  v_bytes = nbytes(v_b);
+    int   n;
     bytea *w_out;
     bytea *m_out;
     bytea *v_out;
@@ -42,12 +47,28 @@ Datum pg_llm_adamw_step(PG_FUNCTION_ARGS)
     bool nulls[3] = {false,false,false};
     HeapTuple rettuple;
 
-    w_out = (bytea*) palloc(n*sizeof(float) + VARHDRSZ);
-    m_out = (bytea*) palloc(n*sizeof(float) + VARHDRSZ);
-    v_out = (bytea*) palloc(n*sizeof(float) + VARHDRSZ);
-    SET_VARSIZE(w_out, n*sizeof(float) + VARHDRSZ);
-    SET_VARSIZE(m_out, n*sizeof(float) + VARHDRSZ);
-    SET_VARSIZE(v_out, n*sizeof(float) + VARHDRSZ);
+    if (w_bytes == 0)
+        ereport(ERROR,
+                (errmsg("pg_llm_adamw_step requires non-empty tensors")));
+    if (w_bytes % sizeof(float) != 0)
+        ereport(ERROR,
+                (errmsg("pg_llm_adamw_step weight buffer must be float32 aligned")));
+    if (w_bytes != g_bytes || w_bytes != m_bytes || w_bytes != v_bytes)
+        ereport(ERROR,
+                (errmsg("pg_llm_adamw_step expects all tensors to have the same length")));
+    if (w_bytes / sizeof(float) > INT_MAX)
+        ereport(ERROR,
+                (errmsg("pg_llm_adamw_step tensor length exceeds INT_MAX")));
+
+    n = (int) (w_bytes / sizeof(float));
+
+    if (t <= 0)
+        ereport(ERROR,
+                (errmsg("pg_llm_adamw_step requires positive step number (got %d)", t)));
+
+    w_out = bytea_same_size(w_b);
+    m_out = bytea_same_size(m_b);
+    v_out = bytea_same_size(v_b);
 
     w = as_float(w_b);
     g = as_float(g_b);
@@ -60,6 +81,9 @@ Datum pg_llm_adamw_step(PG_FUNCTION_ARGS)
     /* bias-correction */
     bc1 = 1.0f - powf(b1, t);
     bc2 = 1.0f - powf(b2, t);
+    if (bc1 == 0.0f || bc2 == 0.0f)
+        ereport(ERROR,
+                (errmsg("pg_llm_adamw_step encountered zero bias correction term")));
 
     /* Follow AdamW (Loshchilov & Hutter, 2019) with decoupled weight decay. */
     for (int i=0;i<n;++i) {
@@ -94,19 +118,35 @@ Datum pg_llm_grad_clip(PG_FUNCTION_ARGS)
 {
     bytea *g_b = PG_GETARG_BYTEA_P(0);
     float  clip = PG_GETARG_FLOAT4(1);
-    int n = (int)(nbytes(g_b)/sizeof(float));
-    float *g = as_float(g_b);
+    Size bytes = nbytes(g_b);
+    int n;
+    float *g;
     float norm=0;
     float scale;
     bytea *out;
     float *go;
 
+    if (bytes == 0)
+        ereport(ERROR,
+                (errmsg("pg_llm_grad_clip requires a non-empty gradient tensor")));
+    if (bytes % sizeof(float) != 0)
+        ereport(ERROR,
+                (errmsg("pg_llm_grad_clip gradient tensor must be float32 aligned")));
+    if (bytes / sizeof(float) > INT_MAX)
+        ereport(ERROR,
+                (errmsg("pg_llm_grad_clip tensor length exceeds INT_MAX")));
+    if (clip < 0.0f)
+        ereport(ERROR,
+                (errmsg("pg_llm_grad_clip requires non-negative clip value")));
+
+    n = (int) (bytes / sizeof(float));
+    g = as_float(g_b);
+
     for(int i=0;i<n;++i) norm += g[i]*g[i];
     norm = sqrtf(norm);
     scale = (norm>clip)? (clip/norm) : 1.0f;
 
-    out = (bytea*) palloc(n*sizeof(float)+VARHDRSZ);
-    SET_VARSIZE(out, n*sizeof(float)+VARHDRSZ);
+    out = bytea_same_size(g_b);
     go = as_float(out);
     for(int i=0;i<n;++i) go[i] = g[i]*scale;
 
@@ -125,6 +165,16 @@ Datum pg_llm_lr_schedule(PG_FUNCTION_ARGS)
     float lr_max = PG_GETARG_FLOAT4(3);
 
     float lr;
+    if (warmup <= 0)
+        ereport(ERROR,
+                (errmsg("pg_llm_lr_schedule warmup steps must be positive")));
+    if (total <= warmup)
+        ereport(ERROR,
+                (errmsg("pg_llm_lr_schedule total steps must exceed warmup steps")));
+    if (lr_max < 0.0f)
+        ereport(ERROR,
+                (errmsg("pg_llm_lr_schedule requires non-negative lr_max")));
+
     if (step < warmup)
         lr = lr_max * (float)step / (float)warmup;
     else {

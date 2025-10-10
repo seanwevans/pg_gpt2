@@ -22,7 +22,13 @@ pg_llm_export_npz(PG_FUNCTION_ARGS)
     Oid     argtypes[1];
     Datum   values[1];
 
-    SPI_connect();
+    if (SPI_connect() != SPI_OK_CONNECT)
+    {
+        pfree(path);
+        pfree(model);
+        ereport(ERROR,
+                (errmsg("SPI_connect failed in pg_llm_export_npz")));
+    }
 
     PG_TRY();
     {
@@ -99,8 +105,11 @@ pg_llm_export_npz(PG_FUNCTION_ARGS)
 
         pfree(DatumGetPointer(model_value));
 
-        gzclose(fp);
+        int gz_rc = gzclose(fp);
         fp = NULL;
+        if (gz_rc != Z_OK)
+            ereport(ERROR,
+                    (errmsg("gzclose failed while exporting %s", path)));
 
         SPI_finish();
     }
@@ -109,6 +118,8 @@ pg_llm_export_npz(PG_FUNCTION_ARGS)
         if (fp)
             gzclose(fp);
         SPI_finish();
+        pfree(path);
+        pfree(model);
         PG_RE_THROW();
     }
     PG_END_TRY();
