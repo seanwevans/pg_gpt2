@@ -8,6 +8,7 @@
 #include "utils/hsearch.h"
 #include "utils/memutils.h"
 #include "utils/lsyscache.h"
+#include <limits.h>
 
 typedef struct TensorRegistryEntry
 {
@@ -28,6 +29,8 @@ static void pg_llm_autograd_map_param_internal(const char *model,
                                                bytea *tensor,
                                                int ndims,
                                                const int *dims);
+
+static Size checked_mul_size(Size a, Size b, const char *context);
 
 static void
 ensure_tensor_registry(void)
@@ -93,29 +96,62 @@ autograd_enabled(void)
 static int tape_insert(const char *name, int *inputs, int n_in, int output, const char *extra_json)
 {
     StringInfoData buf;
+    bool            buf_initialized = false;
 
-    SPI_connect();
+    if (name == NULL || inputs == NULL)
+        ereport(ERROR,
+                (errmsg("tape_insert requires non-NULL name and inputs")));
+    if (n_in < 0)
+        ereport(ERROR,
+                (errmsg("tape_insert received a negative input count")));
 
-    if (!autograd_enabled())
+    if (SPI_connect() != SPI_OK_CONNECT)
+        ereport(ERROR,
+                (errmsg("SPI_connect failed in tape_insert")));
+
+    PG_TRY();
     {
+        if (autograd_enabled())
+        {
+            int spi_rc;
+
+            initStringInfo(&buf);
+            buf_initialized = true;
+
+            appendStringInfo(&buf,
+                             "INSERT INTO llm_tape(name,inputs,output,extra) VALUES('%s',ARRAY[",
+                             name);
+            for (int i = 0; i < n_in; i++)
+            {
+                if (i > 0)
+                    appendStringInfoChar(&buf, ',');
+                appendStringInfo(&buf, "%d", inputs[i]);
+            }
+            appendStringInfo(&buf, "],%d,'%s')",
+                             output,
+                             extra_json ? extra_json : "{}");
+
+            spi_rc = SPI_execute(buf.data, false, 0);
+            if (spi_rc != SPI_OK_INSERT)
+                ereport(ERROR,
+                        (errmsg("failed to insert autograd tape entry (SPI code %d)",
+                                spi_rc)));
+        }
+
         SPI_finish();
-        return output;
     }
-
-    initStringInfo(&buf);
-    appendStringInfo(&buf,
-                     "INSERT INTO llm_tape(name,inputs,output,extra) VALUES('%s',ARRAY[",
-                     name);
-    for (int i = 0; i < n_in; i++)
+    PG_CATCH();
     {
-        if (i > 0)
-            appendStringInfoChar(&buf, ',');
-        appendStringInfo(&buf, "%d", inputs[i]);
+        if (buf_initialized && buf.data)
+            pfree(buf.data);
+        SPI_finish();
+        PG_RE_THROW();
     }
-    appendStringInfo(&buf, "],%d,'%s')",
-                     output,
-                     extra_json ? extra_json : "{}");
-    SPI_execute(buf.data, false, 0);
+    PG_END_TRY();
+
+    if (buf_initialized && buf.data)
+        pfree(buf.data);
+
     return output;
 }
 
@@ -206,6 +242,9 @@ pg_llm_autograd_track_tensor(bytea *tensor, int ndims, const int *dims, bool req
         return entry->id;
 
     entry = (TensorRegistryEntry *) hash_search(tensor_registry, &key, HASH_ENTER, &found);
+    if (entry == NULL)
+        ereport(ERROR,
+                (errmsg("failed to insert tensor into autograd registry")));
     entry->tensor = tensor;
     entry->id = insert_tensor_rt(tensor, ndims, dims, requires_grad);
     return entry->id;
@@ -280,6 +319,15 @@ pg_llm_autograd_map_param(PG_FUNCTION_ARGS)
     int         ndims = 0;
     int        *dims = NULL;
     int         dims_local[8];
+    const char *fn_name = "pg_llm_autograd_map_param";
+    int         num_floats;
+    Size        total_elems = 1;
+    bool        have_shape = false;
+
+    num_floats = float_length(tensor, fn_name);
+    if (num_floats <= 0)
+        ereport(ERROR,
+                (errmsg("%s requires a non-empty tensor", fn_name)));
 
     if (shape != NULL)
     {
@@ -316,17 +364,32 @@ pg_llm_autograd_map_param(PG_FUNCTION_ARGS)
             }
 
             ndims = nelems;
+            have_shape = ndims > 0;
             pfree(elem_values);
             pfree(elem_nulls);
         }
     }
 
-    if (ndims == 0)
+    if (!have_shape)
     {
         ndims = 1;
         dims = dims_local;
-        dims[0] = float_length(tensor, "pg_llm_autograd_map_param");
+        dims[0] = num_floats;
     }
+
+    for (int i = 0; i < ndims; i++)
+    {
+        if (dims[i] <= 0)
+            ereport(ERROR,
+                    (errmsg("%s dimensions must be positive (dimension %d was %d)",
+                            fn_name, i + 1, dims[i])));
+        total_elems = checked_mul_size(total_elems, (Size) dims[i], fn_name);
+    }
+
+    if (total_elems != (Size) num_floats)
+        ereport(ERROR,
+                (errmsg("%s shape product %zu does not match tensor length %d", fn_name,
+                        total_elems, num_floats)));
 
     pg_llm_autograd_map_param_internal(text_to_cstring(model_text),
                                        text_to_cstring(name_text),
@@ -339,4 +402,13 @@ pg_llm_autograd_map_param(PG_FUNCTION_ARGS)
         pfree(dims);
 
     PG_RETURN_VOID();
+}
+
+static Size
+checked_mul_size(Size a, Size b, const char *context)
+{
+    if (a != 0 && b > SIZE_MAX / a)
+        ereport(ERROR,
+                (errmsg("%s dimension product overflow", context)));
+    return a * b;
 }

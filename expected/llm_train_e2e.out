@@ -1,23 +1,36 @@
 SET
 SET
 TRUNCATE TABLE
+COPY 1
 CREATE FUNCTION
 CREATE FUNCTION
 CREATE FUNCTION
- setseed 
+ setseed
 ---------
  
 (1 row)
 
 DO
 INSERT 0 100
- llm_train 
+ llm_train
 -----------
- 
+
 (1 row)
 
 DO
-            label            | logged_steps 
+
+ llm_train
+-----------
+
+(1 row)
+
+ total_steps | min_step | max_step
+-------------+----------+----------
+          10 |        1 |       10
+(1 row)
+
+DO
+            label            | logged_steps
 ----------------------------+--------------
  tiny_e2e loss decreased    |           10
 (1 row)
