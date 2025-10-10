@@ -302,10 +302,8 @@ CREATE TABLE llm_train_log (
 
 CREATE UNLOGGED TABLE llm_dataset (
     id SERIAL PRIMARY KEY,
-    tokens INT[],          -- 1024-token sequence
+    tokens INT[],          -- token sequence
     target INT[],          -- shifted targets
-    CHECK (array_length(tokens, 1) IS NULL OR array_length(tokens, 1) <= 1024),
-    CHECK (array_length(target, 1) IS NULL OR array_length(target, 1) <= 1024),
     CHECK ((array_length(tokens, 1) IS NULL AND array_length(target, 1) IS NULL)
            OR array_length(tokens, 1) = array_length(target, 1))
 );
@@ -678,6 +676,7 @@ RETURNS BYTEA AS $$
 DECLARE
     out BYTEA;
     seq_len INT;
+    matched INT;
 BEGIN
     seq_len := COALESCE(array_length(tokens, 1), 0);
 
@@ -685,16 +684,13 @@ BEGIN
         RETURN ''::BYTEA;
     END IF;
 
-    IF seq_len > 1024 THEN
-        RAISE EXCEPTION 'Sequence length % exceeds GPT-2 maximum of 1024 positions', seq_len;
-    END IF;
-
     -- Flatten summed token and positional embeddings
     SELECT string_agg(
                pg_llm_add(wte.data, wpe.data)::TEXT,
                '' ORDER BY t.ord
-           )::BYTEA
-      INTO out
+           )::BYTEA,
+           COUNT(*)
+      INTO out, matched
       FROM unnest(tokens) WITH ORDINALITY AS t(token_id, ord)
       JOIN llm_param_resolved wte
         ON wte.model = model
@@ -706,7 +702,14 @@ BEGIN
        AND wpe.token_id = t.ord - 1;
 
     IF out IS NULL THEN
-        RAISE EXCEPTION 'Missing token or positional embeddings for model %', model;
+        RAISE EXCEPTION 'Missing token or positional embeddings for model %s', model;
+    END IF;
+
+    IF matched IS DISTINCT FROM seq_len THEN
+        RAISE EXCEPTION USING
+            ERRCODE = 'data_exception',
+            MESSAGE = format('Missing token or positional embeddings for model %s', model),
+            DETAIL = format('Expected %s embeddings but only found %s', seq_len, matched);
     END IF;
 
     RETURN out;

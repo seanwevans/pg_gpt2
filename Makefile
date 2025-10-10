@@ -9,7 +9,7 @@ sql/pg_llm--0.1.0.sql \
 sql/llm_block_forward.sql \
 sql/llm_backprop.sql
 
-REGRESS = adamw dropout llm_train_e2e llm_backprop_layers llm_backprop_tied llm_sampling llm_weight_sharing
+REGRESS = adamw dropout llm_train_e2e llm_long_sequences llm_backprop_layers llm_backprop_tied llm_sampling llm_weight_sharing
 REGRESS_OPTS = --dlpath=$(abs_builddir)
 
 PG_CPPFLAGS += -I$(srcdir)/src
