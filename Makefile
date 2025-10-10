@@ -24,6 +24,11 @@ REGRESS_OPTS = --dlpath=$(abs_builddir)
 
 PG_CPPFLAGS += -I$(srcdir)/src
 
+# Enforce a consistent C standard across all compilation units so that
+# declarations inside loops and other C99 features do not trigger warnings on
+# compilers that default to older dialects.
+PG_CFLAGS += -std=c99
+
 PG_CONFIG ?= pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs 2>/dev/null)
 
