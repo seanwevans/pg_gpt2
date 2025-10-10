@@ -121,8 +121,7 @@ Datum pg_llm_add(PG_FUNCTION_ARGS)
             int input_ids[2];
             input_ids[0] = pg_llm_autograd_track_tensor(a, 1, dims, true);
             input_ids[1] = pg_llm_autograd_track_tensor(b, 1, dims, true);
-            for (int i = 0; i < n; i++)
-                C[i] = A[i] + B[i];
+            pg_llm_vector_add(A, B, C, n);
             int output_id = pg_llm_autograd_track_tensor(out, 1, dims, true);
             pg_llm_autograd_record_tape("add", input_ids, 2, output_id, NULL);
         }
@@ -137,8 +136,7 @@ Datum pg_llm_add(PG_FUNCTION_ARGS)
     }
     else
     {
-        for (int i = 0; i < n; i++)
-            C[i] = A[i] + B[i];
+        pg_llm_vector_add(A, B, C, n);
     }
 
     PG_RETURN_BYTEA_P(out);
@@ -283,9 +281,6 @@ Datum pg_llm_layernorm(PG_FUNCTION_ARGS)
     float *beta;
     bytea *out;
     float *y;
-    float mean = 0.f;
-    float var = 0.f;
-    float inv_std;
     bool autograd = pg_llm_autograd_enabled();
     if (n == 0)
         ereport(ERROR, (errmsg("pg_llm_layernorm requires a non-empty input")));
@@ -315,18 +310,7 @@ Datum pg_llm_layernorm(PG_FUNCTION_ARGS)
             input_ids[1] = pg_llm_autograd_track_tensor(gamma_b, 1, dims, true);
             input_ids[2] = pg_llm_autograd_track_tensor(beta_b, 1, dims, true);
 
-            for (int i = 0; i < n; i++) mean += x[i];
-            mean /= n;
-
-            for (int i = 0; i < n; i++) {
-                float d = x[i] - mean;
-                var += d * d;
-            }
-            var /= n;
-            inv_std = 1.0f / sqrtf(var + eps);
-
-            for (int i = 0; i < n; i++)
-                y[i] = ((x[i] - mean) * inv_std) * gamma[i] + beta[i];
+            pg_llm_layernorm_forward(x, gamma, beta, n, eps, y);
 
             int output_id = pg_llm_autograd_track_tensor(out, 1, dims, true);
             char *extra = psprintf("{\"eps\":%.9g,\"gamma_id\":%d,\"beta_id\":%d}",
@@ -344,18 +328,7 @@ Datum pg_llm_layernorm(PG_FUNCTION_ARGS)
     }
     else
     {
-        for (int i = 0; i < n; i++) mean += x[i];
-        mean /= n;
-
-        for (int i = 0; i < n; i++) {
-            float d = x[i] - mean;
-            var += d * d;
-        }
-        var /= n;
-        inv_std = 1.0f / sqrtf(var + eps);
-
-        for (int i = 0; i < n; i++)
-            y[i] = ((x[i] - mean) * inv_std) * gamma[i] + beta[i];
+        pg_llm_layernorm_forward(x, gamma, beta, n, eps, y);
     }
 
     PG_RETURN_BYTEA_P(out);

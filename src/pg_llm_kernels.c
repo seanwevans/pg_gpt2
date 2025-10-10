@@ -88,3 +88,92 @@ pg_llm_fast_gemm(const float *A, const float *B, float *C,
 
     pfree(B_tile);
 }
+
+void
+pg_llm_vector_add(const float *a, const float *b, float *out, int n)
+{
+#if defined(__AVX__) || defined(__AVX2__)
+    int i = 0;
+    for (; i <= n - 8; i += 8)
+    {
+        __m256 av = _mm256_loadu_ps(a + i);
+        __m256 bv = _mm256_loadu_ps(b + i);
+        __m256 sum = _mm256_add_ps(av, bv);
+        _mm256_storeu_ps(out + i, sum);
+    }
+    for (; i < n; ++i)
+        out[i] = a[i] + b[i];
+#else
+    for (int i = 0; i < n; ++i)
+        out[i] = a[i] + b[i];
+#endif
+}
+
+void
+pg_llm_layernorm_forward(const float *x,
+                         const float *gamma,
+                         const float *beta,
+                         int n,
+                         float eps,
+                         float *y)
+{
+    float sum = 0.0f;
+    float sumsq = 0.0f;
+    int i = 0;
+
+#if defined(__AVX__) || defined(__AVX2__)
+    __m256 sum_v = _mm256_setzero_ps();
+    __m256 sumsq_v = _mm256_setzero_ps();
+    for (; i <= n - 8; i += 8)
+    {
+        __m256 xv = _mm256_loadu_ps(x + i);
+        sum_v = _mm256_add_ps(sum_v, xv);
+#if defined(__AVX2__) && defined(__FMA__)
+        sumsq_v = _mm256_fmadd_ps(xv, xv, sumsq_v);
+#else
+        __m256 xv_sq = _mm256_mul_ps(xv, xv);
+        sumsq_v = _mm256_add_ps(sumsq_v, xv_sq);
+#endif
+    }
+    sum += hsum256_ps(sum_v);
+    sumsq += hsum256_ps(sumsq_v);
+#endif
+
+    for (; i < n; ++i)
+    {
+        float xv = x[i];
+        sum += xv;
+        sumsq += xv * xv;
+    }
+
+    float mean = sum / (float) n;
+    float var = sumsq / (float) n - mean * mean;
+    if (var < 0.0f)
+        var = 0.0f;
+    float inv_std = 1.0f / sqrtf(var + eps);
+
+    i = 0;
+#if defined(__AVX__) || defined(__AVX2__)
+    __m256 mean_v = _mm256_set1_ps(mean);
+    __m256 inv_std_v = _mm256_set1_ps(inv_std);
+    for (; i <= n - 8; i += 8)
+    {
+        __m256 xv = _mm256_loadu_ps(x + i);
+        __m256 gv = _mm256_loadu_ps(gamma + i);
+        __m256 bv = _mm256_loadu_ps(beta + i);
+        __m256 norm = _mm256_mul_ps(_mm256_sub_ps(xv, mean_v), inv_std_v);
+#if defined(__AVX2__) && defined(__FMA__)
+        __m256 yv = _mm256_fmadd_ps(norm, gv, bv);
+#else
+        __m256 yv = _mm256_add_ps(_mm256_mul_ps(norm, gv), bv);
+#endif
+        _mm256_storeu_ps(y + i, yv);
+    }
+#endif
+
+    for (; i < n; ++i)
+    {
+        float norm = (x[i] - mean) * inv_std;
+        y[i] = norm * gamma[i] + beta[i];
+    }
+}
