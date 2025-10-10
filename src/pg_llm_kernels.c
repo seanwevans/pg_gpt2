@@ -31,10 +31,12 @@ pg_llm_fast_gemm(const float *A, const float *B, float *C,
     if (M <= 0 || K <= 0 || N <= 0)
         return;
 
+    int max_n_block = Min(TILE_N, N);
+    Size tile_bytes = (Size) max_n_block * K * sizeof(float);
+    float *B_tile = (float *) palloc(tile_bytes);
+
     for (int j0 = 0; j0 < N; j0 += TILE_N) {
         int n_block = Min(TILE_N, N - j0);
-        Size tile_bytes = (Size)n_block * K * sizeof(float);
-        float *B_tile = (float *) palloc(tile_bytes);
 
         for (int jj = 0; jj < n_block; ++jj) {
             int col = j0 + jj;
@@ -82,6 +84,7 @@ pg_llm_fast_gemm(const float *A, const float *B, float *C,
                 }
             }
         }
-        pfree(B_tile);
     }
+
+    pfree(B_tile);
 }
