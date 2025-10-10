@@ -119,6 +119,9 @@ Imports all pretrained GPT-2 weights into the `llm_param` table.
 ```sql
 -- Generate text directly in SQL
 SELECT llm_generate('Once upon a time', 80, 0.9, 40, 0.92);
+
+-- Stream tokens as they are produced (step, token_id, token, text, is_complete)
+SELECT * FROM llm_generate_stream('Once upon a time', 40, 0.8, 40, 0.95);
 ```
 
 ### Training
@@ -264,6 +267,38 @@ SELECT llm_train('gpt2-small', 5000, 12, 12, 768, 50257);
 -- 5. Save checkpoint
 SELECT llm_checkpoint_save('gpt2-small','finetuned on corpus X');
 ```
+
+---
+
+## Python Client Utilities
+
+Client applications can connect to PostgreSQL using `psycopg` and drive the
+text-generation workflow directly from Python. The :mod:`pg_llm_client`
+package offers a high-level helper:
+
+```python
+import psycopg
+from pg_llm_client import PGLLMClient
+
+with psycopg.connect("postgresql://postgres@localhost:5432/postgres") as conn:
+    client = PGLLMClient(conn)
+
+    # Single completion with tuned sampling parameters
+    print(client.generate("The database that dreamed of language", temperature=0.7))
+
+    # Stream tokens as they arrive
+    for event in client.stream("Streaming from SQL", max_tokens=8):
+        print(event.text)
+
+    # Retrieve the top beam search candidates
+    beams = client.beam_search("Once upon a", beam_width=3, max_tokens=5)
+    for beam in beams:
+        print(beam.score, beam.text)
+```
+
+The helper wraps the SQL API so sampling temperature, beam width, and other
+parameters can be adjusted per request without hand-writing SQL in every
+client.
 
 ---
 

@@ -754,18 +754,69 @@ CREATE OR REPLACE FUNCTION llm_generate(
     max_tokens INT DEFAULT 64,
     temperature FLOAT4 DEFAULT 1.0,
     topk INT DEFAULT 50,
-    topp FLOAT4 DEFAULT 0.95)
+    topp FLOAT4 DEFAULT 0.95,
+    model_name TEXT DEFAULT 'gpt2-small',
+    eos_token INT DEFAULT 50256)
 RETURNS TEXT AS $$
 DECLARE
-    ids INT[] := llm_encode(prompt,'gpt2-small');
+    ids INT[] := COALESCE(llm_encode(prompt, model_name), ARRAY[]::INT[]);
     next_id INT;
 BEGIN
     FOR i IN 1..max_tokens LOOP
-        next_id := pg_llm_sample(llm_logits(ids), temperature, topk, topp);
-        ids := array_append(ids,next_id);
-        EXIT WHEN next_id=50256;
+        next_id := pg_llm_sample(llm_logits(ids, model_name), temperature, topk, topp);
+        ids := array_append(ids, next_id);
+        EXIT WHEN next_id = eos_token;
     END LOOP;
-    RETURN llm_decode(ids,'gpt2-small');
+    RETURN COALESCE(llm_decode(ids, model_name), '');
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION llm_generate_stream(
+    prompt TEXT,
+    max_tokens INT DEFAULT 64,
+    temperature FLOAT4 DEFAULT 1.0,
+    topk INT DEFAULT 50,
+    topp FLOAT4 DEFAULT 0.95,
+    model_name TEXT DEFAULT 'gpt2-small',
+    eos_token INT DEFAULT 50256)
+RETURNS TABLE(
+    step INT,
+    token_id INT,
+    token TEXT,
+    text TEXT,
+    is_complete BOOLEAN)
+AS $$
+DECLARE
+    ids INT[] := COALESCE(llm_encode(prompt, model_name), ARRAY[]::INT[]);
+    next_id INT;
+BEGIN
+    step := 0;
+    LOOP
+        EXIT WHEN step >= max_tokens;
+        step := step + 1;
+
+        next_id := pg_llm_sample(llm_logits(ids, model_name), temperature, topk, topp);
+        ids := array_append(ids, next_id);
+
+        token_id := next_id;
+        token := COALESCE(
+            (
+                SELECT v.token
+                  FROM llm_bpe_vocab v
+                 WHERE v.model = model_name
+                   AND v.token_id = next_id
+                 LIMIT 1
+            ),
+            ''
+        );
+        text := COALESCE(llm_decode(ids, model_name), '');
+        is_complete := next_id = eos_token OR step >= max_tokens;
+        RETURN NEXT;
+
+        EXIT WHEN next_id = eos_token;
+    END LOOP;
+
+    RETURN;
 END;
 $$ LANGUAGE plpgsql;
 
