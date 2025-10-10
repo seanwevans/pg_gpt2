@@ -8,6 +8,7 @@
 #include "utils/hsearch.h"
 #include "utils/memutils.h"
 #include "utils/lsyscache.h"
+#include <limits.h>
 
 typedef struct TensorRegistryEntry
 {
@@ -28,6 +29,8 @@ static void pg_llm_autograd_map_param_internal(const char *model,
                                                bytea *tensor,
                                                int ndims,
                                                const int *dims);
+
+static Size checked_mul_size(Size a, Size b, const char *context);
 
 static void
 ensure_tensor_registry(void)
@@ -280,6 +283,15 @@ pg_llm_autograd_map_param(PG_FUNCTION_ARGS)
     int         ndims = 0;
     int        *dims = NULL;
     int         dims_local[8];
+    const char *fn_name = "pg_llm_autograd_map_param";
+    int         num_floats;
+    Size        total_elems = 1;
+    bool        have_shape = false;
+
+    num_floats = float_length(tensor, fn_name);
+    if (num_floats <= 0)
+        ereport(ERROR,
+                (errmsg("%s requires a non-empty tensor", fn_name)));
 
     if (shape != NULL)
     {
@@ -316,17 +328,32 @@ pg_llm_autograd_map_param(PG_FUNCTION_ARGS)
             }
 
             ndims = nelems;
+            have_shape = ndims > 0;
             pfree(elem_values);
             pfree(elem_nulls);
         }
     }
 
-    if (ndims == 0)
+    if (!have_shape)
     {
         ndims = 1;
         dims = dims_local;
-        dims[0] = float_length(tensor, "pg_llm_autograd_map_param");
+        dims[0] = num_floats;
     }
+
+    for (int i = 0; i < ndims; i++)
+    {
+        if (dims[i] <= 0)
+            ereport(ERROR,
+                    (errmsg("%s dimensions must be positive (dimension %d was %d)",
+                            fn_name, i + 1, dims[i])));
+        total_elems = checked_mul_size(total_elems, (Size) dims[i], fn_name);
+    }
+
+    if (total_elems != (Size) num_floats)
+        ereport(ERROR,
+                (errmsg("%s shape product %zu does not match tensor length %d", fn_name,
+                        total_elems, num_floats)));
 
     pg_llm_autograd_map_param_internal(text_to_cstring(model_text),
                                        text_to_cstring(name_text),
@@ -339,4 +366,13 @@ pg_llm_autograd_map_param(PG_FUNCTION_ARGS)
         pfree(dims);
 
     PG_RETURN_VOID();
+}
+
+static Size
+checked_mul_size(Size a, Size b, const char *context)
+{
+    if (a != 0 && b > SIZE_MAX / a)
+        ereport(ERROR,
+                (errmsg("%s dimension product overflow", context)));
+    return a * b;
 }
