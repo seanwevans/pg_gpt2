@@ -1,0 +1,40 @@
+SET
+SET
+DROP FUNCTION
+CREATE FUNCTION
+CREATE FUNCTION
+ setseed 
+---------
+ 
+(1 row)
+
+      label      | token_id 
+-----------------+----------
+ baseline sample |        2
+(1 row)
+
+         label         | token_id 
+-----------------------+----------
+ topk=1 returns argmax |        2
+(1 row)
+
+ setseed 
+---------
+ 
+(1 row)
+
+        label         | token_id 
+----------------------+----------
+ topp=0.2 prunes tail |        3
+(1 row)
+
+ setseed 
+---------
+ 
+(1 row)
+
+               label                | token_id 
+------------------------------------+----------
+ temperature=0.5 skews distribution |        1
+(1 row)
+
