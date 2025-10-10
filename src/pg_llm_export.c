@@ -1,10 +1,11 @@
 #include "pg_llm.h"
 #include "access/htup_details.h"
 #include "lib/stringinfo.h"
+#include "utils/array.h"
 #include <zlib.h>
 #include <limits.h>
 
-static void write_npz_entry(gzFile fp, const char *name, bytea *data);
+static void write_npz_entry(gzFile fp, const char *name, bytea *data, ArrayType *shape_array);
 static void gzwrite_exact(gzFile fp, const void *src, Size nbytes, const char *context);
 
 PG_FUNCTION_INFO_V1(pg_llm_export_npz);
@@ -37,7 +38,12 @@ pg_llm_export_npz(PG_FUNCTION_ARGS)
         values[0] = model_value;
 
         spi_rc = SPI_execute_with_args(
-            "SELECT name, data FROM llm_param WHERE model = $1 ORDER BY name, token_id",
+            "SELECT p.name, p.data, t.shape "
+            "FROM llm_param p "
+            "LEFT JOIN llm_tensor_map m ON (m.model = p.model AND m.name = p.name AND m.token_id = p.token_id) "
+            "LEFT JOIN llm_tensor_rt t ON (t.id = m.tensor_id) "
+            "WHERE p.model = $1 "
+            "ORDER BY p.name, p.token_id",
             1, argtypes, values, NULL, true, 0);
 
         if (spi_rc != SPI_OK_SELECT)
@@ -51,10 +57,13 @@ pg_llm_export_npz(PG_FUNCTION_ARGS)
             bool        isnull;
             Datum       name_d;
             Datum       data_d;
+            Datum       shape_d;
             text       *name_t;
             bytea      *data_b;
+            ArrayType  *shape_a = NULL;
             char       *name_cstr;
             Pointer     data_ptr;
+            Pointer     shape_ptr = NULL;
 
             name_d = SPI_getbinval(tuple, tupdesc, 1, &isnull);
             if (isnull)
@@ -72,11 +81,20 @@ pg_llm_export_npz(PG_FUNCTION_ARGS)
             data_ptr = DatumGetPointer(data_d);
             data_b = DatumGetByteaP(data_d);
 
-            write_npz_entry(fp, name_cstr, data_b);
+            shape_d = SPI_getbinval(tuple, tupdesc, 3, &isnull);
+            if (!isnull)
+            {
+                shape_ptr = DatumGetPointer(shape_d);
+                shape_a = DatumGetArrayTypeP(shape_d);
+            }
+
+            write_npz_entry(fp, name_cstr, data_b, shape_a);
 
             pfree(name_cstr);
             if ((Pointer) data_b != data_ptr)
                 pfree(data_b);
+            if (shape_a && (Pointer) shape_a != shape_ptr)
+                pfree(shape_a);
         }
 
         pfree(DatumGetPointer(model_value));
@@ -102,12 +120,17 @@ pg_llm_export_npz(PG_FUNCTION_ARGS)
 }
 
 static void
-write_npz_entry(gzFile fp, const char *name, bytea *data)
+write_npz_entry(gzFile fp, const char *name, bytea *data, ArrayType *shape_array)
 {
     Size        name_len;
     Size        payload_bytes;
     Size        elem_size = sizeof(float);
     Size        nelems;
+    Size        dims_local[8];
+    Size       *dims = dims_local;
+    int         ndims = 0;
+    bool        dims_allocated = false;
+    bool        use_shape = false;
     StringInfoData header;
     Size        base_len;
     Size        pad;
@@ -143,10 +166,86 @@ write_npz_entry(gzFile fp, const char *name, bytea *data)
 
     nelems = payload_bytes / elem_size;
 
+    if (shape_array != NULL)
+    {
+        if (ARR_ELEMTYPE(shape_array) != INT4OID)
+            ereport(ERROR,
+                    (errmsg("tensor %s has non-int32 shape metadata", name)));
+
+        if (ARR_HASNULL(shape_array))
+            ereport(ERROR,
+                    (errmsg("tensor %s shape metadata contains NULLs", name)));
+
+        if (ARR_NDIM(shape_array) > 0)
+        {
+            int         ndims_shape = ArrayGetNItems(ARR_NDIM(shape_array), ARR_DIMS(shape_array));
+
+            if (ndims_shape > 0)
+            {
+                int32      *shape_vals = (int32 *) ARR_DATA_PTR(shape_array);
+                Size        total = 1;
+
+                if (ndims_shape > (int) lengthof(dims_local))
+                {
+                    dims = (Size *) palloc(sizeof(Size) * ndims_shape);
+                    dims_allocated = true;
+                }
+
+                ndims = ndims_shape;
+                use_shape = true;
+
+                for (int i = 0; i < ndims_shape; i++)
+                {
+                    if (shape_vals[i] <= 0)
+                    {
+                        use_shape = false;
+                        break;
+                    }
+
+                    if (total > SIZE_MAX / (Size) shape_vals[i])
+                        ereport(ERROR,
+                                (errmsg("tensor %s shape metadata overflows element count", name)));
+
+                    total *= (Size) shape_vals[i];
+                    dims[i] = (Size) shape_vals[i];
+                }
+
+                if (!use_shape || total != nelems)
+                {
+                    use_shape = false;
+                    ndims = 0;
+                }
+            }
+        }
+    }
+
+    if (!use_shape)
+    {
+        ndims = 1;
+        if (dims_allocated)
+        {
+            pfree(dims);
+            dims = dims_local;
+            dims_allocated = false;
+        }
+        dims[0] = nelems;
+    }
+
     initStringInfo(&header);
-    appendStringInfo(&header,
-                     "{'descr': '<f4', 'fortran_order': False, 'shape': (%zu,), }",
-                     (size_t) nelems);
+    appendStringInfoString(&header,
+                           "{'descr': '<f4', 'fortran_order': False, 'shape': (");
+
+    for (int i = 0; i < ndims; i++)
+    {
+        if (i > 0)
+            appendStringInfoString(&header, ", ");
+        appendStringInfo(&header, "%zu", (size_t) dims[i]);
+    }
+
+    if (ndims == 1)
+        appendStringInfoString(&header, ",");
+
+    appendStringInfoString(&header, "), }");
 
     base_len = header.len;
 
@@ -179,6 +278,8 @@ write_npz_entry(gzFile fp, const char *name, bytea *data)
 
     pfree(header.data);
     pfree(header_buf);
+    if (dims_allocated)
+        pfree(dims);
 }
 
 static void
