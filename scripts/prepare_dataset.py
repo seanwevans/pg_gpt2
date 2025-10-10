@@ -58,23 +58,71 @@ def iter_input_paths(patterns: Sequence[str]) -> Iterable[Path]:
             yield path
 
 
-def load_corpus(patterns: Sequence[str]) -> str:
-    texts: List[str] = []
-    for path in iter_input_paths(patterns):
-        texts.append(path.read_text(encoding="utf-8"))
-    return "\n".join(texts)
-
-
-def chunk_tokens(tokens: Sequence[int], block_size: int) -> Iterator[Tuple[List[int], List[int]]]:
+def stream_token_rows(
+    tokenizer,
+    patterns: Sequence[str],
+    block_size: int,
+    *,
+    read_size: int = 1 << 16,
+    overlap: int = 1024,
+) -> Iterator[Tuple[List[int], List[int]]]:
+    """Yield training rows by tokenizing the corpus without materializing it."""
     if block_size < 2:
         raise ValueError("block_size must be at least 2")
-    step = block_size
-    max_start = len(tokens) - block_size - 1
-    for start in range(0, max_start + 1, step):
-        window = tokens[start : start + block_size + 1]
-        if len(window) < block_size + 1:
-            continue
-        yield list(window[:-1]), list(window[1:])
+
+    paths = list(iter_input_paths(patterns))
+
+    token_buffer: List[int] = []
+    text_buffer = ""
+    overlap_chars = max(overlap, 1)
+
+    eos_token = tokenizer.eos_token or tokenizer.pad_token
+    if eos_token is None:  # pragma: no cover - tokenizer should always define one
+        raise ValueError("Tokenizer must define an EOS or PAD token")
+
+    def drain_buffer() -> Iterator[Tuple[List[int], List[int]]]:
+        while len(token_buffer) >= block_size + 1:
+            yield list(token_buffer[:block_size]), list(token_buffer[1 : block_size + 1])
+            del token_buffer[:block_size]
+
+    def encode_and_buffer(text: str) -> Iterator[Tuple[List[int], List[int]]]:
+        if not text:
+            return
+        tokens = tokenizer.encode(text, add_special_tokens=False)
+        if not tokens:
+            return
+        token_buffer.extend(tokens)
+        yield from drain_buffer()
+
+    def flush_text_buffer(flush_all: bool) -> Iterator[Tuple[List[int], List[int]]]:
+        nonlocal text_buffer
+        if not text_buffer:
+            return
+        if flush_all:
+            segment, text_buffer = text_buffer, ""
+        elif len(text_buffer) > overlap_chars:
+            cutoff = len(text_buffer) - overlap_chars
+            segment = text_buffer[:cutoff]
+            text_buffer = text_buffer[cutoff:]
+        else:
+            return
+        yield from encode_and_buffer(segment)
+
+    for index, path in enumerate(paths):
+        with path.open("r", encoding="utf-8") as src:
+            while True:
+                chunk = src.read(read_size)
+                if not chunk:
+                    break
+                text_buffer += chunk
+                yield from flush_text_buffer(flush_all=False)
+
+        yield from flush_text_buffer(flush_all=True)
+
+        if index < len(paths) - 1:
+            yield from encode_and_buffer("\n")
+
+    yield from encode_and_buffer(eos_token)
 
 
 def insert_examples(conn: psycopg.Connection, rows: Iterable[Tuple[List[int], List[int]]], batch_size: int = 256) -> int:
@@ -143,12 +191,13 @@ def main() -> None:
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    corpus = load_corpus(args.input)
-    token_ids = tokenizer.encode(corpus + tokenizer.eos_token)
-
     with psycopg.connect(args.dsn) as conn:
         maybe_truncate(conn, args.truncate)
-        total = insert_examples(conn, chunk_tokens(token_ids, args.block_size), args.batch_size)
+        total = insert_examples(
+            conn,
+            stream_token_rows(tokenizer, args.input, args.block_size),
+            args.batch_size,
+        )
 
     print(f"Inserted {total} examples into llm_dataset")
 
