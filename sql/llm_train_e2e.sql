@@ -2,14 +2,6 @@
 SET client_min_messages = warning;
 SET extra_float_digits = 3;
 
-TRUNCATE llm_param,
-         llm_dataset,
-         llm_train_log,
-         llm_tensor,
-         llm_tensor_rt,
-         llm_tensor_map,
-         llm_tape;
-
 -- Deterministic helpers for zero and uniform random tensors.
 CREATE OR REPLACE FUNCTION llm_tensor_zeros(len int)
 RETURNS bytea
@@ -94,19 +86,28 @@ BEGIN
 END;
 $$;
 
-SELECT setseed(0.123456);
-
-DO $$
+CREATE OR REPLACE PROCEDURE tiny_e2e_prepare(seed float8)
+LANGUAGE plpgsql
+AS $$
 DECLARE
     model TEXT := 'tiny_e2e';
     d INT := 64;
     n_layer INT := 2;
-    n_head INT := 4;
     vocab INT := 32;
     seq_len INT := 8;
     layer INT;
     token_id INT;
 BEGIN
+    TRUNCATE llm_param,
+             llm_dataset,
+             llm_train_log,
+             llm_tensor,
+             llm_tensor_rt,
+             llm_tensor_map,
+             llm_tape;
+
+    PERFORM setseed(seed);
+
     -- Token embeddings.
     FOR token_id IN 0..(vocab - 1) LOOP
         INSERT INTO llm_param(model, name, token_id, data, grad, m, v, step)
@@ -160,24 +161,25 @@ BEGIN
     VALUES
         (model, 'ln_f.weight', llm_tensor_fill(d, 1.0), NULL, llm_tensor_zeros(d), llm_tensor_zeros(d), 0),
         (model, 'ln_f.bias',   llm_tensor_zeros(d),     NULL, llm_tensor_zeros(d), llm_tensor_zeros(d), 0);
+    -- Synthetic dataset: 100 sequences with deterministic token patterns.
+    INSERT INTO llm_dataset(tokens, target)
+    SELECT tokens, targets
+    FROM (
+        SELECT
+            ARRAY(
+                SELECT ((seq + pos) % 32)
+                FROM generate_series(0, 7) AS pos
+            )::int[] AS tokens,
+            ARRAY(
+                SELECT ((seq + pos + 1) % 32)
+                FROM generate_series(0, 7) AS pos
+            )::int[] AS targets
+        FROM generate_series(0, 99) AS seq
+    ) AS examples;
 END;
 $$;
 
--- Synthetic dataset: 100 sequences with deterministic token patterns.
-INSERT INTO llm_dataset(tokens, target)
-SELECT tokens, targets
-FROM (
-    SELECT
-        ARRAY(
-            SELECT ((seq + pos) % 32)
-            FROM generate_series(0, 7) AS pos
-        )::int[] AS tokens,
-        ARRAY(
-            SELECT ((seq + pos + 1) % 32)
-            FROM generate_series(0, 7) AS pos
-        )::int[] AS targets
-    FROM generate_series(0, 99) AS seq
-) AS examples;
+CALL tiny_e2e_prepare(0.123456);
 
 SELECT llm_train('tiny_e2e', 10, 2, 4, 64, 32,
                  dropout_p => 0.0,
@@ -193,16 +195,18 @@ DO $$
 DECLARE
     initial_loss FLOAT4;
     final_loss FLOAT4;
+    initial_perplexity FLOAT4;
+    final_perplexity FLOAT4;
 BEGIN
-    SELECT loss
-      INTO initial_loss
+    SELECT loss, exp(loss)
+      INTO initial_loss, initial_perplexity
       FROM llm_train_log
      WHERE model = 'tiny_e2e'
      ORDER BY step
      LIMIT 1;
 
-    SELECT loss
-      INTO final_loss
+    SELECT loss, exp(loss)
+      INTO final_loss, final_perplexity
       FROM llm_train_log
      WHERE model = 'tiny_e2e'
      ORDER BY step DESC
@@ -215,6 +219,66 @@ BEGIN
     IF final_loss >= initial_loss - 1e-6 THEN
         RAISE EXCEPTION 'expected loss to decrease (initial=%, final=%)', initial_loss, final_loss;
     END IF;
+    IF final_perplexity >= initial_perplexity - 1e-6 THEN
+        RAISE EXCEPTION 'expected perplexity to decrease (initial=%, final=%)', initial_perplexity, final_perplexity;
+    END IF;
+END;
+$$;
+
+SELECT 'tiny_e2e perplexity decreased' AS label,
+       TRUE AS passed;
+
+CREATE TEMP TABLE first_run_log AS
+SELECT step, lr, loss
+  FROM llm_train_log
+ WHERE model = 'tiny_e2e'
+ ORDER BY step;
+
+CALL tiny_e2e_prepare(0.123456);
+
+SELECT llm_train('tiny_e2e', 10, 2, 4, 64, 32,
+                 dropout_p => 0.0,
+                 beta1 => 0.9,
+                 beta2 => 0.999,
+                 eps => 1e-8,
+                 wd => 0.01,
+                 lr_max => 0.01,
+                 warmup => 2,
+                 grad_clip => NULL);
+
+DO $$
+DECLARE
+    diff_count INT;
+BEGIN
+    SELECT COUNT(*)
+      INTO diff_count
+      FROM (
+            SELECT step, lr, loss
+              FROM first_run_log
+            EXCEPT ALL
+            SELECT step, lr, loss
+              FROM llm_train_log
+             WHERE model = 'tiny_e2e'
+           ) AS missing_rows;
+
+    IF diff_count <> 0 THEN
+        RAISE EXCEPTION 'reproducibility mismatch: missing % rows', diff_count;
+    END IF;
+
+    SELECT COUNT(*)
+      INTO diff_count
+      FROM (
+            SELECT step, lr, loss
+              FROM llm_train_log
+             WHERE model = 'tiny_e2e'
+            EXCEPT ALL
+            SELECT step, lr, loss
+              FROM first_run_log
+           ) AS extra_rows;
+
+    IF diff_count <> 0 THEN
+        RAISE EXCEPTION 'reproducibility mismatch: extra % rows', diff_count;
+    END IF;
 END;
 $$;
 
@@ -222,3 +286,11 @@ SELECT 'tiny_e2e loss decreased' AS label,
        COUNT(*) AS logged_steps
   FROM llm_train_log
  WHERE model = 'tiny_e2e';
+
+SELECT 'tiny_e2e reproducibility verified' AS label,
+       COUNT(*) AS matching_steps
+  FROM first_run_log fr
+  JOIN llm_train_log sr
+    ON fr.step = sr.step
+   AND fr.lr = sr.lr
+   AND fr.loss = sr.loss;
