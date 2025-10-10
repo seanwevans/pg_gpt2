@@ -130,6 +130,14 @@ RETURNS FLOAT4
 AS 'MODULE_PATHNAME', 'pg_llm_lr_schedule'
 LANGUAGE C STRICT;
 
+CREATE TABLE llm_model_config (
+    model TEXT PRIMARY KEY,
+    n_layer INT NOT NULL,
+    n_head INT NOT NULL,
+    d_model INT NOT NULL,
+    vocab_size INT NOT NULL
+);
+
 CREATE TABLE llm_param (
     model TEXT,
     name TEXT,
@@ -174,14 +182,31 @@ CREATE UNLOGGED TABLE llm_dataset (
            OR array_length(tokens, 1) = array_length(target, 1))
 );
 
+CREATE OR REPLACE FUNCTION llm_get_model_config(p_model TEXT)
+RETURNS llm_model_config AS $$
+DECLARE
+    cfg llm_model_config%ROWTYPE;
+BEGIN
+    SELECT * INTO cfg
+      FROM llm_model_config
+     WHERE model = p_model;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Missing configuration for model %', p_model;
+    END IF;
+
+    RETURN cfg;
+END;
+$$ LANGUAGE plpgsql STRICT;
+
 CREATE OR REPLACE FUNCTION llm_loss(
     model TEXT,
     tokens INT[],
     targets INT[],
-    n_layer INT,
-    n_head INT,
-    D INT,
-    vocab INT,
+    n_layer INT DEFAULT NULL,
+    n_head INT DEFAULT NULL,
+    D INT DEFAULT NULL,
+    vocab INT DEFAULT NULL,
     dropout_p FLOAT4 DEFAULT 0.1,
     training BOOLEAN DEFAULT true)
 RETURNS FLOAT4 AS $$
@@ -189,18 +214,31 @@ DECLARE
     x BYTEA;
     logits BYTEA;
     loss FLOAT4 := 0.0;
+    cfg llm_model_config%ROWTYPE;
+    layers INT := n_layer;
+    heads INT := n_head;
+    hidden INT := D;
+    vocab_size INT := vocab;
 BEGIN
+    IF layers IS NULL OR heads IS NULL OR hidden IS NULL OR vocab_size IS NULL THEN
+        cfg := llm_get_model_config(model);
+        layers := COALESCE(layers, cfg.n_layer);
+        heads := COALESCE(heads, cfg.n_head);
+        hidden := COALESCE(hidden, cfg.d_model);
+        vocab_size := COALESCE(vocab_size, cfg.vocab_size);
+    END IF;
+
     -- 1. Embed tokens
-    x := llm_embed(tokens, model, D);   -- we'll define this below
+    x := llm_embed(tokens, model, hidden);   -- we'll define this below
 
     -- 2. Forward pass through transformer
     x := llm_forward_gpt2(
         x,
         model,
-        n_layer,
-        n_head,
+        layers,
+        heads,
         array_length(tokens,1),
-        D,
+        hidden,
         (SELECT data FROM llm_param p WHERE p.model = model AND p.name = 'ln_f.weight'),
         (SELECT data FROM llm_param p WHERE p.model = model AND p.name = 'ln_f.bias'),
         dropout_p => dropout_p,
@@ -214,12 +252,12 @@ BEGIN
         (SELECT string_agg(p.data::TEXT, '' ORDER BY p.token_id)::BYTEA
          FROM llm_param p
          WHERE p.model = model AND p.name = 'wte'),
-        array_length(tokens,1), D, vocab);
+        array_length(tokens,1), hidden, vocab_size);
 
     -- 4. Compute loss per token
     FOR i IN 1..array_length(targets,1) LOOP
         loss := loss + pg_llm_cross_entropy(
-            substring(logits FROM ((i-1)*vocab+1) FOR vocab)::bytea,
+            substring(logits FROM ((i-1)*vocab_size+1) FOR vocab_size)::bytea,
             targets[i]);
     END LOOP;
     RETURN loss / array_length(targets,1);
@@ -229,10 +267,10 @@ $$ LANGUAGE plpgsql;
 CREATE OR REPLACE FUNCTION llm_train_step(
     model TEXT,
     batch_id INT,
-    n_layer INT,
-    n_head INT,
-    D INT,
-    vocab INT,
+    n_layer INT DEFAULT NULL,
+    n_head INT DEFAULT NULL,
+    D INT DEFAULT NULL,
+    vocab INT DEFAULT NULL,
     dropout_p FLOAT4 DEFAULT 0.1,
     beta1 FLOAT4,
     beta2 FLOAT4,
@@ -250,6 +288,11 @@ DECLARE
     lr FLOAT4;
     loss FLOAT4;
     tape_top INT;
+    cfg llm_model_config%ROWTYPE;
+    layers INT := n_layer;
+    heads INT := n_head;
+    hidden INT := D;
+    vocab_size INT := vocab;
 BEGIN
     SELECT tokens, target INTO seq, target
     FROM llm_dataset
@@ -257,6 +300,14 @@ BEGIN
 
     IF seq IS NULL OR target IS NULL THEN
         RAISE EXCEPTION 'No dataset row with id % for model %', batch_id, model;
+    END IF;
+
+    IF layers IS NULL OR heads IS NULL OR hidden IS NULL OR vocab_size IS NULL THEN
+        cfg := llm_get_model_config(model);
+        layers := COALESCE(layers, cfg.n_layer);
+        heads := COALESCE(heads, cfg.n_head);
+        hidden := COALESCE(hidden, cfg.d_model);
+        vocab_size := COALESCE(vocab_size, cfg.vocab_size);
     END IF;
 
     SELECT COALESCE(MAX(step), 0) + 1 INTO step_count
@@ -274,7 +325,7 @@ BEGIN
 
     -- Forward pass with autograd recording enabled
     INSERT INTO llm_autograd_mode(flag) VALUES(true);
-    loss := llm_loss(model, seq, target, n_layer, n_head, D, vocab,
+    loss := llm_loss(model, seq, target, layers, heads, hidden, vocab_size,
                      dropout_p => dropout_p,
                      training => true);
     DELETE FROM llm_autograd_mode;
@@ -356,10 +407,10 @@ $$ LANGUAGE plpgsql;
 CREATE OR REPLACE FUNCTION llm_train(
     model TEXT,
     n_steps INT,
-    n_layer INT,
-    n_head INT,
-    D INT,
-    vocab INT,
+    n_layer INT DEFAULT NULL,
+    n_head INT DEFAULT NULL,
+    D INT DEFAULT NULL,
+    vocab INT DEFAULT NULL,
     dropout_p FLOAT4 DEFAULT 0.1,
     beta1 FLOAT4 DEFAULT 0.9,
     beta2 FLOAT4 DEFAULT 0.999,
@@ -375,7 +426,20 @@ DECLARE
     dataset_size INT;
     idx INT := 1;
     batch_id INT;
+    cfg llm_model_config%ROWTYPE;
+    layers INT := n_layer;
+    heads INT := n_head;
+    hidden INT := D;
+    vocab_size INT := vocab;
 BEGIN
+    IF layers IS NULL OR heads IS NULL OR hidden IS NULL OR vocab_size IS NULL THEN
+        cfg := llm_get_model_config(model);
+        layers := COALESCE(layers, cfg.n_layer);
+        heads := COALESCE(heads, cfg.n_head);
+        hidden := COALESCE(hidden, cfg.d_model);
+        vocab_size := COALESCE(vocab_size, cfg.vocab_size);
+    END IF;
+
     SELECT array_agg(id ORDER BY random()) INTO dataset_ids FROM llm_dataset;
     dataset_size := COALESCE(array_length(dataset_ids, 1), 0);
 
@@ -398,7 +462,7 @@ BEGIN
 
         loss := llm_train_step(
             model, batch_id,
-            n_layer, n_head, D, vocab,
+            layers, heads, hidden, vocab_size,
             dropout_p,
             beta1, beta2, eps, wd,
             lr_max, warmup, n_steps,
@@ -522,24 +586,26 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+/* Example training step outline (replace placeholders with actual values).
 BEGIN;
   DELETE FROM llm_tape;
   DELETE FROM llm_tensor_rt;
 
   -- Forward pass with autograd enabled
   INSERT INTO llm_autograd_mode VALUES(true);
-  PERFORM llm_loss('gpt2-small', seq, target, 12, 12, 768, 50257);
+  PERFORM llm_loss('your-model', seq, target);
 
   -- Reverse pass
-  PERFORM llm_backprop((SELECT MAX(id) FROM llm_tape), 'gpt2-small');
+  PERFORM llm_backprop((SELECT MAX(id) FROM llm_tape), 'your-model');
 
   -- Gradient accumulation
-  PERFORM llm_accumulate_grads('gpt2-small');
+  PERFORM llm_accumulate_grads('your-model');
 
   -- Optimizer update
   PERFORM llm_train_step(...);
 
 COMMIT;
+*/
 
 CREATE FUNCTION pg_llm_softmax_backward(y BYTEA, dy BYTEA)
 RETURNS BYTEA
@@ -675,8 +741,8 @@ $$ LANGUAGE plpgsql;
 CREATE OR REPLACE FUNCTION llm_logits(
     token_ids INT[],
     model_name TEXT DEFAULT 'gpt2-small',
-    n_layer INT DEFAULT 12,
-    n_head INT DEFAULT 12,
+    n_layer INT DEFAULT NULL,
+    n_head INT DEFAULT NULL,
     d_model INT DEFAULT NULL,
     vocab_size INT DEFAULT NULL)
 RETURNS BYTEA AS $$
@@ -684,14 +750,27 @@ DECLARE
     seq_len INT := COALESCE(array_length(token_ids, 1), 0);
     x BYTEA;
     weight_matrix BYTEA;
+    cfg llm_model_config%ROWTYPE;
+    layers INT := n_layer;
+    heads INT := n_head;
+    hidden INT := d_model;
+    resolved_vocab INT := vocab_size;
 BEGIN
     IF seq_len = 0 THEN
         RETURN ''::BYTEA;
     END IF;
 
-    IF d_model IS NULL THEN
+    IF layers IS NULL OR heads IS NULL OR hidden IS NULL OR resolved_vocab IS NULL THEN
+        cfg := llm_get_model_config(model_name);
+        layers := COALESCE(layers, cfg.n_layer);
+        heads := COALESCE(heads, cfg.n_head);
+        hidden := COALESCE(hidden, cfg.d_model);
+        resolved_vocab := COALESCE(resolved_vocab, cfg.vocab_size);
+    END IF;
+
+    IF hidden IS NULL THEN
         SELECT octet_length(p.data) / 4
-          INTO d_model
+          INTO hidden
           FROM llm_param p
          WHERE p.model = model_name
            AND p.name = 'wte'
@@ -699,33 +778,33 @@ BEGIN
          LIMIT 1;
     END IF;
 
-    IF d_model IS NULL THEN
+    IF hidden IS NULL THEN
         RAISE EXCEPTION 'Missing token embeddings for model %', model_name;
     END IF;
 
-    IF vocab_size IS NULL THEN
+    IF resolved_vocab IS NULL THEN
         SELECT COUNT(*)
-          INTO vocab_size
+          INTO resolved_vocab
           FROM llm_param p
          WHERE p.model = model_name
            AND p.name = 'wte';
     END IF;
 
-    x := llm_embed(token_ids, model_name, d_model);
+    x := llm_embed(token_ids, model_name, hidden);
 
     x := llm_forward_gpt2(
         x,
         model_name,
-        n_layer,
-        n_head,
+        layers,
+        heads,
         seq_len,
-        d_model,
+        hidden,
         dropout_p => 0.0::float4,
         training => false);
 
     SELECT string_agg(p.data::TEXT, '' ORDER BY p.token_id)::BYTEA
       INTO weight_matrix
-      FROM llm_param p
+     FROM llm_param p
      WHERE p.model = model_name
        AND p.name = 'wte';
 
@@ -733,7 +812,7 @@ BEGIN
         RAISE EXCEPTION 'Missing token embeddings for model %', model_name;
     END IF;
 
-    RETURN pg_llm_matmul(x, weight_matrix, seq_len, d_model, vocab_size);
+    RETURN pg_llm_matmul(x, weight_matrix, seq_len, hidden, resolved_vocab);
 END;
 $$ LANGUAGE plpgsql;
 

@@ -5,6 +5,7 @@ SET extra_float_digits = 3;
 TRUNCATE llm_param,
          llm_dataset,
          llm_train_log,
+         llm_model_config,
          llm_tensor,
          llm_tensor_rt,
          llm_tensor_map,
@@ -108,6 +109,14 @@ DECLARE
     token_id INT;
 BEGIN
     -- Token embeddings.
+    INSERT INTO llm_model_config(model, n_layer, n_head, d_model, vocab_size)
+    VALUES (model, n_layer, n_head, d, vocab)
+    ON CONFLICT (model) DO UPDATE
+        SET n_layer = EXCLUDED.n_layer,
+            n_head = EXCLUDED.n_head,
+            d_model = EXCLUDED.d_model,
+            vocab_size = EXCLUDED.vocab_size;
+
     FOR token_id IN 0..(vocab - 1) LOOP
         INSERT INTO llm_param(model, name, token_id, data, grad, m, v, step)
         VALUES (

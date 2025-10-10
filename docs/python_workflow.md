@@ -76,5 +76,13 @@ pip install transformers torch psycopg[binary]
 With the tables populated you can now train directly in SQL, for example:
 
 ```sql
-SELECT llm_train('gpt2-small', 1000, 12, 12, 768, 50257, 0.9, 0.999, 1e-8, 0.01, 2.5e-4, 2000);
+INSERT INTO llm_model_config(model, n_layer, n_head, d_model, vocab_size)
+VALUES ('gpt2-small', 12, 12, 768, 50257)
+ON CONFLICT (model) DO UPDATE
+    SET n_layer = EXCLUDED.n_layer,
+        n_head = EXCLUDED.n_head,
+        d_model = EXCLUDED.d_model,
+        vocab_size = EXCLUDED.vocab_size;
+
+SELECT llm_train(model => 'gpt2-small', n_steps => 1000);
 ```

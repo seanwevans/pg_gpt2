@@ -110,6 +110,15 @@ so that gradients can be replayed later. The key moving pieces are:
 
 ```sql
 SELECT pg_llm_import_npz('/mnt/models/gpt2-small.npz', 'gpt2-small');
+
+-- Register the transformer dimensions for inference/training defaults.
+INSERT INTO llm_model_config(model, n_layer, n_head, d_model, vocab_size)
+VALUES ('gpt2-small', 12, 12, 768, 50257)
+ON CONFLICT (model) DO UPDATE
+    SET n_layer = EXCLUDED.n_layer,
+        n_head = EXCLUDED.n_head,
+        d_model = EXCLUDED.d_model,
+        vocab_size = EXCLUDED.vocab_size;
 ```
 
 Imports all pretrained GPT-2 weights into the `llm_param` table.
@@ -126,11 +135,10 @@ SELECT llm_generate('Once upon a time', 80, 0.9, 40, 0.92);
 ```sql
 -- Train for 10,000 steps on tokenized text dataset
 SELECT llm_train(
-  'gpt2-small',
-  10000,        -- steps
-  12, 12, 768,  -- layers, heads, hidden size
-  50257,        -- vocab size
-  0.9, 0.999, 1e-8, 0.01, 2.5e-4, 2000
+  model   => 'gpt2-small',
+  n_steps => 10000,
+  lr_max  => 2.5e-4,
+  warmup  => 2000
 );
 ```
 
