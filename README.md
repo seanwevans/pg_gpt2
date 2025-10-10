@@ -131,6 +131,8 @@ SELECT llm_train(
   12, 12, 768,  -- layers, heads, hidden size
   50257,        -- vocab size
   0.9, 0.999, 1e-8, 0.01, 2.5e-4, 2000
+  grad_workers => 4,
+  prune_workers => 4
 );
 ```
 
@@ -140,6 +142,18 @@ Every step performs:
 3. Gradient accumulation
 4. AdamW parameter updates
 5. Logging to `llm_train_log`
+
+The training helpers expose knobs for multi-core cleanup work:
+
+- `grad_workers` sets the desired parallel worker count for `llm_accumulate_grads`,
+  allowing gradient materialisation from `llm_tensor_rt` into `llm_param` to leverage
+  PostgreSQL's parallel query engine.
+- `prune_workers` applies the same hinting to `llm_prune_autograd_state`, which clears
+  the autograd tape and runtime tensors between steps. Autograd tape pruning is safe
+  to parallelise because every runtime tensor row is independent, so this option simply
+  tunes planner settings before issuing the deletes.
+
+Both parameters default to `1` (no parallel workers) to preserve existing behaviour.
 
 ### Checkpointing
 
