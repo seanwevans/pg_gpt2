@@ -64,6 +64,7 @@ If PostgreSQL is installed somewhere custom, set the `PG_CONFIG` environment var
 
 | Table | Purpose |
 |--------|----------|
+| `llm_model_config` | Registered model dimensions (layers, heads, embedding size, positions, vocab). |
 | `llm_param` | Model parameters, gradients, optimizer state. |
 | `llm_dataset` | Tokenized training sequences. |
 | `llm_tape` / `llm_tensor_rt` | Computational graph and runtime tensors for autograd. |
@@ -113,6 +114,9 @@ SELECT pg_llm_import_npz('/mnt/models/gpt2-small.npz', 'gpt2-small');
 ```
 
 Imports all pretrained GPT-2 weights into the `llm_param` table.
+`llm_model_config` tracks the expected architecture dimensions for each model
+and is consulted during import; `gpt2-small` is pre-registered, but custom
+models should insert their configuration before calling `pg_llm_import_npz`.
 
 ### Forward Pass and Inference
 

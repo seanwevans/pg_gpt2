@@ -130,6 +130,21 @@ RETURNS FLOAT4
 AS 'MODULE_PATHNAME', 'pg_llm_lr_schedule'
 LANGUAGE C STRICT;
 
+CREATE TABLE llm_model_config (
+    model TEXT PRIMARY KEY,
+    n_layer INT NOT NULL CHECK (n_layer > 0),
+    n_head INT NOT NULL CHECK (n_head > 0),
+    d_model INT NOT NULL CHECK (d_model > 0),
+    n_positions INT NOT NULL CHECK (n_positions > 0),
+    vocab INT NOT NULL CHECK (vocab > 0),
+    CHECK (d_model % n_head = 0)
+);
+
+-- Default configuration for the reference GPT-2 small checkpoint
+INSERT INTO llm_model_config(model, n_layer, n_head, d_model, n_positions, vocab)
+VALUES ('gpt2-small', 12, 12, 768, 1024, 50257)
+ON CONFLICT (model) DO NOTHING;
+
 CREATE TABLE llm_param (
     model TEXT,
     name TEXT,
