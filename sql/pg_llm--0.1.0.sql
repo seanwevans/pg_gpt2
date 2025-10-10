@@ -130,6 +130,39 @@ RETURNS FLOAT4
 AS 'MODULE_PATHNAME', 'pg_llm_lr_schedule'
 LANGUAGE C STRICT;
 
+CREATE TABLE llm_model_config (
+    model TEXT PRIMARY KEY,
+    n_layer INT NOT NULL CHECK (n_layer > 0),
+    n_head INT NOT NULL CHECK (n_head > 0),
+    d_model INT NOT NULL CHECK (d_model > 0),
+    n_positions INT NOT NULL CHECK (n_positions > 0),
+    vocab INT NOT NULL CHECK (vocab > 0),
+    CHECK (d_model % n_head = 0)
+);
+
+-- Default configuration for the reference GPT-2 small checkpoint
+INSERT INTO llm_model_config(model, n_layer, n_head, d_model, n_positions, vocab)
+VALUES ('gpt2-small', 12, 12, 768, 1024, 50257)
+ON CONFLICT (model) DO NOTHING;
+
+CREATE OR REPLACE FUNCTION llm_get_model_config(p_model TEXT)
+RETURNS llm_model_config AS $$
+DECLARE
+    cfg llm_model_config%ROWTYPE;
+BEGIN
+    SELECT * INTO cfg
+      FROM llm_model_config
+     WHERE model = p_model;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Missing llm_model_config entry for model %', p_model
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+
+    RETURN cfg;
+END;
+$$ LANGUAGE plpgsql STABLE;
+
 CREATE TABLE llm_param (
     model TEXT,
     name TEXT,
@@ -141,6 +174,127 @@ CREATE TABLE llm_param (
     step INT DEFAULT 0,
     PRIMARY KEY (model, name, token_id)
 );
+
+-- Mapping for parameters that share weights with another model.
+CREATE TABLE llm_param_share (
+    source_model TEXT NOT NULL,
+    source_name TEXT NOT NULL,
+    source_token_id INT DEFAULT 0 NOT NULL,
+    target_model TEXT NOT NULL,
+    target_name TEXT NOT NULL,
+    target_token_id INT DEFAULT 0 NOT NULL,
+    PRIMARY KEY (target_model, target_name, target_token_id)
+);
+
+-- Helper view that resolves shared parameters to their underlying storage.
+CREATE OR REPLACE VIEW llm_param_resolved AS
+    SELECT model, name, token_id, data, grad, m, v, step
+      FROM llm_param
+    UNION ALL
+    SELECT s.target_model AS model,
+           s.target_name AS name,
+           s.target_token_id AS token_id,
+           p.data,
+           p.grad,
+           p.m,
+           p.v,
+           p.step
+      FROM llm_param_share s
+      JOIN llm_param p
+        ON p.model = s.source_model
+       AND p.name = s.source_name
+       AND p.token_id = s.source_token_id;
+
+CREATE OR REPLACE FUNCTION llm_share_param(
+    source_model TEXT,
+    source_name TEXT,
+    source_token_id INT DEFAULT 0,
+    target_model TEXT,
+    target_name TEXT DEFAULT NULL,
+    target_token_id INT DEFAULT NULL)
+RETURNS VOID AS $$
+DECLARE
+    dest_name TEXT := COALESCE(target_name, source_name);
+    dest_token INT := COALESCE(target_token_id, source_token_id);
+BEGIN
+    PERFORM 1
+      FROM llm_param
+     WHERE model = source_model
+       AND name = source_name
+       AND token_id = source_token_id;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'cannot share parameter %.%[%] because it does not exist',
+            source_model, source_name, source_token_id;
+    END IF;
+
+    DELETE FROM llm_param
+     WHERE model = target_model
+       AND name = dest_name
+       AND token_id = dest_token;
+
+    INSERT INTO llm_param_share(
+        source_model, source_name, source_token_id,
+        target_model, target_name, target_token_id)
+    VALUES (source_model, source_name, source_token_id,
+            target_model, dest_name, dest_token)
+    ON CONFLICT (target_model, target_name, target_token_id)
+    DO UPDATE SET source_model = EXCLUDED.source_model,
+                  source_name = EXCLUDED.source_name,
+                  source_token_id = EXCLUDED.source_token_id;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION llm_unshare_param(
+    target_model TEXT,
+    target_name TEXT,
+    target_token_id INT DEFAULT 0,
+    copy_optimizer_state BOOLEAN DEFAULT true)
+RETURNS VOID AS $$
+DECLARE
+    share_rec RECORD;
+BEGIN
+    SELECT *
+      INTO share_rec
+      FROM llm_param_share
+     WHERE target_model = llm_unshare_param.target_model
+       AND target_name = llm_unshare_param.target_name
+       AND target_token_id = llm_unshare_param.target_token_id;
+
+    IF NOT FOUND THEN
+        DELETE FROM llm_param_share
+         WHERE target_model = llm_unshare_param.target_model
+           AND target_name = llm_unshare_param.target_name
+           AND target_token_id = llm_unshare_param.target_token_id;
+        RETURN;
+    END IF;
+
+    DELETE FROM llm_param_share
+     WHERE target_model = share_rec.target_model
+       AND target_name = share_rec.target_name
+       AND target_token_id = share_rec.target_token_id;
+
+    INSERT INTO llm_param(model, name, token_id, data, grad, m, v, step)
+    SELECT share_rec.target_model,
+           share_rec.target_name,
+           share_rec.target_token_id,
+           p.data,
+           NULL,
+           CASE WHEN copy_optimizer_state THEN p.m ELSE NULL::BYTEA END,
+           CASE WHEN copy_optimizer_state THEN p.v ELSE NULL::BYTEA END,
+           CASE WHEN copy_optimizer_state THEN p.step ELSE 0 END
+      FROM llm_param p
+     WHERE p.model = share_rec.source_model
+       AND p.name = share_rec.source_name
+       AND p.token_id = share_rec.source_token_id
+    ON CONFLICT (model, name, token_id) DO UPDATE
+        SET data = EXCLUDED.data,
+            grad = NULL,
+            m = EXCLUDED.m,
+            v = EXCLUDED.v,
+            step = EXCLUDED.step;
+END;
+$$ LANGUAGE plpgsql;
 
 -- Materialized tensors used during the forward pass (activations, cached weights)
 CREATE UNLOGGED TABLE llm_tensor (
@@ -166,13 +320,227 @@ CREATE TABLE llm_train_log (
 
 CREATE UNLOGGED TABLE llm_dataset (
     id SERIAL PRIMARY KEY,
-    tokens INT[],          -- 1024-token sequence
+    tokens INT[],          -- token sequence
     target INT[],          -- shifted targets
-    CHECK (array_length(tokens, 1) IS NULL OR array_length(tokens, 1) <= 1024),
-    CHECK (array_length(target, 1) IS NULL OR array_length(target, 1) <= 1024),
     CHECK ((array_length(tokens, 1) IS NULL AND array_length(target, 1) IS NULL)
            OR array_length(tokens, 1) = array_length(target, 1))
 );
+
+CREATE OR REPLACE FUNCTION llm_block_forward(
+    input BYTEA,
+    w_qkv BYTEA,
+    b_qkv BYTEA,
+    w_o BYTEA,
+    b_o BYTEA,
+    w_fc BYTEA,
+    b_fc BYTEA,
+    w_proj BYTEA,
+    b_proj BYTEA,
+    ln1_g BYTEA,
+    ln1_b BYTEA,
+    ln2_g BYTEA,
+    ln2_b BYTEA,
+    n_head INT,
+    T INT,
+    D INT,
+    eps FLOAT4 DEFAULT 1e-5,
+    dropout_p FLOAT4 DEFAULT 0.1,
+    training BOOLEAN DEFAULT false)
+RETURNS BYTEA AS $$
+DECLARE
+    x BYTEA := input;
+    attn BYTEA;
+    mlp BYTEA;
+    residual2 BYTEA;
+BEGIN
+    -- 1. LayerNorm
+    x := pg_llm_layernorm(x, ln1_g, ln1_b, eps);
+
+    -- 2. Self-Attention
+    attn := pg_llm_attention(x, w_qkv, b_qkv, w_o, b_o, n_head, T, D);
+    IF training AND dropout_p > 0 THEN
+        attn := pg_llm_dropout(attn, dropout_p, training);
+    END IF;
+    x := pg_llm_add(input, attn);  -- residual 1
+
+    -- 3. LayerNorm
+    residual2 := x;
+    x := pg_llm_layernorm(x, ln2_g, ln2_b, eps);
+
+    -- 4. Feed-Forward MLP
+    mlp := pg_llm_matmul(x, w_fc, T, D, 4*D);
+    mlp := pg_llm_add(mlp, b_fc);
+    mlp := pg_llm_gelu(mlp);
+    mlp := pg_llm_matmul(mlp, w_proj, T, 4*D, D);
+    mlp := pg_llm_add(mlp, b_proj);
+    IF training AND dropout_p > 0 THEN
+        mlp := pg_llm_dropout(mlp, dropout_p, training);
+    END IF;
+
+    x := pg_llm_add(residual2, mlp);       -- residual 2
+    RETURN x;
+END;
+$$ LANGUAGE plpgsql STRICT;
+
+CREATE OR REPLACE FUNCTION llm_forward_gpt2(
+    input BYTEA,
+    model TEXT,
+    n_layer INT,
+    n_head INT,
+    T INT,
+    D INT,
+    ln_f_weight BYTEA DEFAULT NULL,
+    ln_f_bias BYTEA DEFAULT NULL,
+    dropout_p FLOAT4 DEFAULT 0.1,
+    training BOOLEAN DEFAULT false)
+RETURNS BYTEA AS $$
+DECLARE
+    x BYTEA := input;
+    w_qkv BYTEA;
+    b_qkv BYTEA;
+    w_o BYTEA;
+    b_o BYTEA;
+    w_fc BYTEA;
+    b_fc BYTEA;
+    w_proj BYTEA;
+    b_proj BYTEA;
+    ln1_g BYTEA;
+    ln1_b BYTEA;
+    ln2_g BYTEA;
+    ln2_b BYTEA;
+    b_fc_full BYTEA;
+    b_proj_full BYTEA;
+    expected_fc_bytes INT := T * 4 * D * 4;
+    expected_proj_bytes INT := T * D * 4;
+    per_token_fc_bytes INT := 4 * D * 4;
+    per_token_proj_bytes INT := D * 4;
+    final_weight BYTEA := ln_f_weight;
+    final_bias BYTEA := ln_f_bias;
+BEGIN
+    FOR i IN 0..(n_layer-1) LOOP
+        SELECT data INTO w_qkv FROM llm_tensor WHERE name = format('h.%s.attn.c_attn.weight', i);
+        SELECT data INTO b_qkv FROM llm_tensor WHERE name = format('h.%s.attn.c_attn.bias', i);
+        IF b_qkv IS NULL THEN
+            SELECT data INTO b_qkv FROM llm_param WHERE name = format('h.%s.attn.c_attn.bias', i) AND token_id = 0 LIMIT 1;
+        END IF;
+        IF b_qkv IS NULL THEN
+            RAISE EXCEPTION 'Missing attention qkv bias for layer %', i;
+        END IF;
+        SELECT data INTO w_o FROM llm_tensor WHERE name = format('h.%s.attn.c_proj.weight', i);
+        SELECT data INTO b_o FROM llm_tensor WHERE name = format('h.%s.attn.c_proj.bias', i);
+        IF b_o IS NULL THEN
+            SELECT data INTO b_o FROM llm_param WHERE name = format('h.%s.attn.c_proj.bias', i) AND token_id = 0 LIMIT 1;
+        END IF;
+        IF b_o IS NULL THEN
+            RAISE EXCEPTION 'Missing attention proj bias for layer %', i;
+        END IF;
+        SELECT data INTO w_fc FROM llm_tensor WHERE name = format('h.%s.mlp.c_fc.weight', i);
+        SELECT data INTO b_fc FROM llm_tensor WHERE name = format('h.%s.mlp.c_fc.bias', i);
+        SELECT data INTO w_proj FROM llm_tensor WHERE name = format('h.%s.mlp.c_proj.weight', i);
+        SELECT data INTO b_proj FROM llm_tensor WHERE name = format('h.%s.mlp.c_proj.bias', i);
+        SELECT data INTO ln1_g FROM llm_tensor WHERE name = format('h.%s.ln_1.weight', i);
+        SELECT data INTO ln1_b FROM llm_tensor WHERE name = format('h.%s.ln_1.bias', i);
+        SELECT data INTO ln2_g FROM llm_tensor WHERE name = format('h.%s.ln_2.weight', i);
+        SELECT data INTO ln2_b FROM llm_tensor WHERE name = format('h.%s.ln_2.bias', i);
+
+        IF b_fc IS NULL THEN
+            RAISE EXCEPTION 'Missing MLP fc bias for layer %', i;
+        END IF;
+        IF b_proj IS NULL THEN
+            RAISE EXCEPTION 'Missing MLP proj bias for layer %', i;
+        END IF;
+
+        IF octet_length(b_fc) = expected_fc_bytes THEN
+            b_fc_full := b_fc;
+        ELSIF octet_length(b_fc) = per_token_fc_bytes THEN
+            SELECT string_agg(b_fc, ''::bytea) INTO b_fc_full
+            FROM generate_series(1, T);
+        ELSE
+            RAISE EXCEPTION 'MLP fc bias for layer % has % bytes, expected % (broadcasted) or % (per token)',
+                i, octet_length(b_fc), expected_fc_bytes, per_token_fc_bytes;
+        END IF;
+
+        IF octet_length(b_proj) = expected_proj_bytes THEN
+            b_proj_full := b_proj;
+        ELSIF octet_length(b_proj) = per_token_proj_bytes THEN
+            SELECT string_agg(b_proj, ''::bytea) INTO b_proj_full
+            FROM generate_series(1, T);
+        ELSE
+            RAISE EXCEPTION 'MLP proj bias for layer % has % bytes, expected % (broadcasted) or % (per token)',
+                i, octet_length(b_proj), expected_proj_bytes, per_token_proj_bytes;
+        END IF;
+
+        PERFORM pg_llm_autograd_map_param(
+            model,
+            format('h.%s.mlp.c_fc.bias', i),
+            0,
+            b_fc_full,
+            ARRAY[octet_length(b_fc_full) / 4]
+        );
+
+        PERFORM pg_llm_autograd_map_param(
+            model,
+            format('h.%s.mlp.c_proj.bias', i),
+            0,
+            b_proj_full,
+            ARRAY[octet_length(b_proj_full) / 4]
+        );
+
+        x := llm_block_forward(
+            x,
+            w_qkv,
+            b_qkv,
+            w_o,
+            b_o,
+            w_fc,
+            b_fc_full,
+            w_proj,
+            b_proj_full,
+            ln1_g,
+            ln1_b,
+            ln2_g,
+            ln2_b,
+            n_head, T, D,
+            dropout_p => dropout_p,
+            training => training);
+    END LOOP;
+    IF final_weight IS NULL THEN
+        SELECT data INTO final_weight
+        FROM llm_tensor
+        WHERE name = 'ln_f.weight'
+        LIMIT 1;
+    END IF;
+
+    IF final_weight IS NULL THEN
+        SELECT data INTO final_weight
+        FROM llm_param
+        WHERE name = 'ln_f.weight'
+          AND token_id = 0
+        LIMIT 1;
+    END IF;
+
+    IF final_bias IS NULL THEN
+        SELECT data INTO final_bias
+        FROM llm_tensor
+        WHERE name = 'ln_f.bias'
+        LIMIT 1;
+    END IF;
+
+    IF final_bias IS NULL THEN
+        SELECT data INTO final_bias
+        FROM llm_param
+        WHERE name = 'ln_f.bias'
+          AND token_id = 0
+        LIMIT 1;
+    END IF;
+
+    IF final_weight IS NULL OR final_bias IS NULL THEN
+        RAISE EXCEPTION 'Missing ln_f parameters for final layernorm';
+    END IF;
+
+    RETURN pg_llm_layernorm(x, final_weight, final_bias, 1e-5);
+END;
+$$ LANGUAGE plpgsql;
 
 CREATE OR REPLACE FUNCTION llm_loss(
     model TEXT,
@@ -201,8 +569,8 @@ BEGIN
         n_head,
         array_length(tokens,1),
         D,
-        (SELECT data FROM llm_param p WHERE p.model = model AND p.name = 'ln_f.weight'),
-        (SELECT data FROM llm_param p WHERE p.model = model AND p.name = 'ln_f.bias'),
+        (SELECT data FROM llm_param_resolved p WHERE p.model = model AND p.name = 'ln_f.weight'),
+        (SELECT data FROM llm_param_resolved p WHERE p.model = model AND p.name = 'ln_f.bias'),
         dropout_p => dropout_p,
         training => training);
 
@@ -212,7 +580,7 @@ BEGIN
     --    logits gradient is accumulated back into each `wte` row.
     logits := pg_llm_matmul(x,
         (SELECT string_agg(p.data::TEXT, '' ORDER BY p.token_id)::BYTEA
-         FROM llm_param p
+         FROM llm_param_resolved p
          WHERE p.model = model AND p.name = 'wte'),
         array_length(tokens,1), D, vocab);
 
@@ -241,7 +609,9 @@ CREATE OR REPLACE FUNCTION llm_train_step(
     lr_max FLOAT4,
     warmup INT,
     total_steps INT,
-    grad_clip FLOAT4 DEFAULT NULL)
+    grad_clip FLOAT4 DEFAULT NULL,
+    grad_workers INT DEFAULT 1,
+    prune_workers INT DEFAULT 1)
 RETURNS FLOAT4 AS $$
 DECLARE
     seq INT[];
@@ -260,13 +630,12 @@ BEGIN
     END IF;
 
     SELECT COALESCE(MAX(step), 0) + 1 INTO step_count
-    FROM llm_param
-    WHERE llm_param.model = model;
+    FROM llm_param_resolved
+    WHERE model = llm_train_step.model;
 
     lr := pg_llm_lr_schedule(step_count, warmup, total_steps, lr_max);
     -- Reset autograd state from the previous step
-    DELETE FROM llm_tape;
-    DELETE FROM llm_tensor_rt;
+    PERFORM llm_prune_autograd_state(prune_workers);
     DELETE FROM llm_autograd_mode;
 
     -- Populate cached tensors for the forward pass
@@ -285,29 +654,36 @@ BEGIN
     END IF;
 
     PERFORM llm_backprop(tape_top, model);
-    PERFORM llm_accumulate_grads(model);
+    PERFORM llm_accumulate_grads(model, grad_workers);
 
-    UPDATE llm_param
+    UPDATE llm_param p
     SET (data, m, v, grad, step) = (
         SELECT s.weight, s.m, s.v, NULL::BYTEA, step_count
         FROM pg_llm_adamw_step(
-            data,
+            p.data,
             CASE
-                WHEN grad IS NULL OR grad_clip IS NULL OR grad_clip <= 0 THEN grad
-                ELSE pg_llm_grad_clip(grad, grad_clip)
+                WHEN p.grad IS NULL OR grad_clip IS NULL OR grad_clip <= 0 THEN p.grad
+                ELSE pg_llm_grad_clip(p.grad, grad_clip)
             END,
-            m, v,
+            p.m, p.v,
             lr, beta1, beta2, eps, wd, step_count
         ) AS s
     )
-    WHERE llm_param.model = model;
+    WHERE p.model = model
+       OR EXISTS (
+            SELECT 1
+              FROM llm_param_share s
+             WHERE s.target_model = model
+               AND s.source_model = p.model
+               AND s.source_name = p.name
+               AND s.source_token_id = p.token_id
+        );
 
     INSERT INTO llm_train_log(model, step, lr, loss)
     VALUES(model, step_count, lr, loss);
 
     -- Free runtime autograd state eagerly so the next step starts clean
-    DELETE FROM llm_tape;
-    DELETE FROM llm_tensor_rt;
+    PERFORM llm_prune_autograd_state(prune_workers);
 
     RETURN loss;
 END;
@@ -318,6 +694,7 @@ RETURNS BYTEA AS $$
 DECLARE
     out BYTEA;
     seq_len INT;
+    matched INT;
 BEGIN
     seq_len := COALESCE(array_length(tokens, 1), 0);
 
@@ -325,28 +702,32 @@ BEGIN
         RETURN ''::BYTEA;
     END IF;
 
-    IF seq_len > 1024 THEN
-        RAISE EXCEPTION 'Sequence length % exceeds GPT-2 maximum of 1024 positions', seq_len;
-    END IF;
-
     -- Flatten summed token and positional embeddings
     SELECT string_agg(
                pg_llm_add(wte.data, wpe.data)::TEXT,
                '' ORDER BY t.ord
-           )::BYTEA
-      INTO out
+           )::BYTEA,
+           COUNT(*)
+      INTO out, matched
       FROM unnest(tokens) WITH ORDINALITY AS t(token_id, ord)
-      JOIN llm_param wte
+      JOIN llm_param_resolved wte
         ON wte.model = model
        AND wte.name = 'wte'
        AND wte.token_id = t.token_id
-      JOIN llm_param wpe
+      JOIN llm_param_resolved wpe
         ON wpe.model = model
        AND wpe.name = 'wpe'
        AND wpe.token_id = t.ord - 1;
 
     IF out IS NULL THEN
-        RAISE EXCEPTION 'Missing token or positional embeddings for model %', model;
+        RAISE EXCEPTION 'Missing token or positional embeddings for model %s', model;
+    END IF;
+
+    IF matched IS DISTINCT FROM seq_len THEN
+        RAISE EXCEPTION USING
+            ERRCODE = 'data_exception',
+            MESSAGE = format('Missing token or positional embeddings for model %s', model),
+            DETAIL = format('Expected %s embeddings but only found %s', seq_len, matched);
     END IF;
 
     RETURN out;
@@ -356,10 +737,10 @@ $$ LANGUAGE plpgsql;
 CREATE OR REPLACE FUNCTION llm_train(
     model TEXT,
     n_steps INT,
-    n_layer INT,
-    n_head INT,
-    D INT,
-    vocab INT,
+    n_layer INT DEFAULT NULL,
+    n_head INT DEFAULT NULL,
+    D INT DEFAULT NULL,
+    vocab INT DEFAULT NULL,
     dropout_p FLOAT4 DEFAULT 0.1,
     beta1 FLOAT4 DEFAULT 0.9,
     beta2 FLOAT4 DEFAULT 0.999,
@@ -367,7 +748,9 @@ CREATE OR REPLACE FUNCTION llm_train(
     wd FLOAT4 DEFAULT 0.01,
     lr_max FLOAT4 DEFAULT 2.5e-4,
     warmup INT DEFAULT 2000,
-    grad_clip FLOAT4 DEFAULT NULL)
+    grad_clip FLOAT4 DEFAULT NULL,
+    grad_workers INT DEFAULT 1,
+    prune_workers INT DEFAULT 1)
 RETURNS VOID AS $$
 DECLARE
     loss FLOAT4;
@@ -375,7 +758,27 @@ DECLARE
     dataset_size INT;
     idx INT := 1;
     batch_id INT;
+    cfg llm_model_config%ROWTYPE;
+    effective_n_layer INT := n_layer;
+    effective_n_head INT := n_head;
+    effective_d INT := D;
+    effective_vocab INT := vocab;
 BEGIN
+    IF effective_n_layer IS NULL OR effective_n_head IS NULL
+       OR effective_d IS NULL OR effective_vocab IS NULL THEN
+        cfg := llm_get_model_config(model);
+        effective_n_layer := COALESCE(effective_n_layer, cfg.n_layer);
+        effective_n_head := COALESCE(effective_n_head, cfg.n_head);
+        effective_d := COALESCE(effective_d, cfg.d_model);
+        effective_vocab := COALESCE(effective_vocab, cfg.vocab);
+    END IF;
+
+    IF effective_n_layer IS NULL OR effective_n_head IS NULL
+       OR effective_d IS NULL OR effective_vocab IS NULL THEN
+        RAISE EXCEPTION 'Missing model configuration parameters for %', model
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+
     SELECT array_agg(id ORDER BY random()) INTO dataset_ids FROM llm_dataset;
     dataset_size := COALESCE(array_length(dataset_ids, 1), 0);
 
@@ -398,11 +801,13 @@ BEGIN
 
         loss := llm_train_step(
             model, batch_id,
-            n_layer, n_head, D, vocab,
+            effective_n_layer, effective_n_head, effective_d, effective_vocab,
             dropout_p,
             beta1, beta2, eps, wd,
             lr_max, warmup, n_steps,
-            grad_clip);
+            grad_clip,
+            grad_workers,
+            prune_workers);
 
         RAISE NOTICE 'step %/% loss=%', i, n_steps, loss;
     END LOOP;
@@ -456,6 +861,7 @@ RETURNS VOID AS $$
 DECLARE
     rec RECORD;
     tensor_name TEXT;
+    tensor_id INT;
 BEGIN
     -- Clear cached tensors for this step
     DELETE FROM llm_tensor;
@@ -464,8 +870,21 @@ BEGIN
     -- Copy parameters into the tensor cache and create runtime tensors
     FOR rec IN
         SELECT name, token_id, data
-        FROM llm_param
-        WHERE model = p_model
+        FROM (
+            SELECT p.name, p.token_id, p.data
+            FROM llm_param p
+            WHERE p.model = p_model
+            UNION ALL
+            SELECT s.target_name AS name,
+                   s.target_token_id AS token_id,
+                   src.data
+            FROM llm_param_share s
+            JOIN llm_param src
+              ON src.model = s.source_model
+             AND src.name = s.source_name
+             AND src.token_id = s.source_token_id
+            WHERE s.target_model = p_model
+        ) params
     LOOP
         tensor_name := CASE
                            WHEN rec.token_id = 0 THEN rec.name
@@ -501,13 +920,29 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-CREATE OR REPLACE FUNCTION llm_accumulate_grads(p_model TEXT)
+CREATE OR REPLACE FUNCTION llm_accumulate_grads(p_model TEXT, p_workers INT DEFAULT 1)
 RETURNS VOID AS $$
+DECLARE
+    effective_workers INT := GREATEST(COALESCE(p_workers, 1), 1);
 BEGIN
+    IF effective_workers > 1 THEN
+        PERFORM set_config('max_parallel_workers_per_gather', effective_workers::TEXT, true);
+        PERFORM set_config('parallel_setup_cost', '0', true);
+        PERFORM set_config('parallel_tuple_cost', '0', true);
+    END IF;
+
     -- Clear stale gradients for this model
-    UPDATE llm_param
+    UPDATE llm_param p
     SET grad = NULL
-    WHERE model = p_model;
+    WHERE p.model = p_model
+       OR EXISTS (
+            SELECT 1
+              FROM llm_param_share s
+             WHERE s.target_model = p_model
+               AND s.source_model = p.model
+               AND s.source_name = p.name
+               AND s.source_token_id = p.token_id
+        );
 
     -- Populate grads from runtime tensors recorded during autograd
     UPDATE llm_param p
@@ -519,16 +954,52 @@ BEGIN
       AND p.name = m.name
       AND p.token_id = m.token_id
       AND t.grad IS NOT NULL;
+
+    UPDATE llm_param p
+    SET grad = t.grad
+    FROM llm_param_share s
+    JOIN llm_tensor_map m
+      ON m.model = s.target_model
+     AND m.name = s.target_name
+     AND m.token_id = s.target_token_id
+    JOIN llm_tensor_rt t ON t.id = m.tensor_id
+    WHERE s.target_model = p_model
+      AND p.model = s.source_model
+      AND p.name = s.source_name
+      AND p.token_id = s.source_token_id
+      AND t.grad IS NOT NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION llm_prune_autograd_state(p_workers INT DEFAULT 1)
+RETURNS VOID AS $$
+DECLARE
+    effective_workers INT := GREATEST(COALESCE(p_workers, 1), 1);
+BEGIN
+    IF effective_workers > 1 THEN
+        PERFORM set_config('max_parallel_workers_per_gather', effective_workers::TEXT, true);
+        PERFORM set_config('parallel_setup_cost', '0', true);
+        PERFORM set_config('parallel_tuple_cost', '0', true);
+    END IF;
+
+    DELETE FROM llm_tape;
+    DELETE FROM llm_tensor_rt;
 END;
 $$ LANGUAGE plpgsql;
 
 BEGIN;
-  DELETE FROM llm_tape;
-  DELETE FROM llm_tensor_rt;
+  PERFORM llm_prune_autograd_state();
 
   -- Forward pass with autograd enabled
   INSERT INTO llm_autograd_mode VALUES(true);
-  PERFORM llm_loss('gpt2-small', seq, target, 12, 12, 768, 50257);
+  PERFORM llm_loss(
+      'gpt2-small',
+      seq,
+      target,
+      (SELECT n_layer FROM llm_model_config WHERE model = 'gpt2-small'),
+      (SELECT n_head FROM llm_model_config WHERE model = 'gpt2-small'),
+      (SELECT d_model FROM llm_model_config WHERE model = 'gpt2-small'),
+      (SELECT vocab FROM llm_model_config WHERE model = 'gpt2-small'));
 
   -- Reverse pass
   PERFORM llm_backprop((SELECT MAX(id) FROM llm_tape), 'gpt2-small');
@@ -578,13 +1049,13 @@ CREATE OR REPLACE FUNCTION llm_checkpoint_save(model TEXT, note TEXT)
 RETURNS VOID AS $$
 DECLARE
     path TEXT := format('/mnt/checkpoints/%s-step%s.npz', model,
-                        (SELECT MAX(step) FROM llm_param WHERE model=model));
+                        (SELECT MAX(step) FROM llm_param_resolved WHERE model=model));
     n BIGINT;
 BEGIN
     PERFORM pg_llm_export_npz(path, model);
-    SELECT COUNT(*) INTO n FROM llm_param WHERE model=model;
+    SELECT COUNT(*) INTO n FROM llm_param_resolved WHERE model=model;
     INSERT INTO llm_checkpoint(model,step,n_params,file_path,note)
-    VALUES(model,(SELECT MAX(step) FROM llm_param WHERE model=model),
+    VALUES(model,(SELECT MAX(step) FROM llm_param_resolved WHERE model=model),
            n,path,note);
 END;
 $$ LANGUAGE plpgsql;
@@ -675,8 +1146,8 @@ $$ LANGUAGE plpgsql;
 CREATE OR REPLACE FUNCTION llm_logits(
     token_ids INT[],
     model_name TEXT DEFAULT 'gpt2-small',
-    n_layer INT DEFAULT 12,
-    n_head INT DEFAULT 12,
+    n_layer INT DEFAULT NULL,
+    n_head INT DEFAULT NULL,
     d_model INT DEFAULT NULL,
     vocab_size INT DEFAULT NULL)
 RETURNS BYTEA AS $$
@@ -684,48 +1155,62 @@ DECLARE
     seq_len INT := COALESCE(array_length(token_ids, 1), 0);
     x BYTEA;
     weight_matrix BYTEA;
+    cfg llm_model_config%ROWTYPE;
+    effective_n_layer INT := n_layer;
+    effective_n_head INT := n_head;
+    effective_d_model INT := d_model;
+    effective_vocab INT := vocab_size;
 BEGIN
     IF seq_len = 0 THEN
         RETURN ''::BYTEA;
     END IF;
 
-    IF d_model IS NULL THEN
+    IF effective_n_layer IS NULL OR effective_n_head IS NULL
+       OR effective_d_model IS NULL OR effective_vocab IS NULL THEN
+        cfg := llm_get_model_config(model_name);
+        effective_n_layer := COALESCE(effective_n_layer, cfg.n_layer);
+        effective_n_head := COALESCE(effective_n_head, cfg.n_head);
+        effective_d_model := COALESCE(effective_d_model, cfg.d_model);
+        effective_vocab := COALESCE(effective_vocab, cfg.vocab);
+    END IF;
+
+    IF effective_d_model IS NULL THEN
         SELECT octet_length(p.data) / 4
-          INTO d_model
-          FROM llm_param p
+          INTO effective_d_model
+          FROM llm_param_resolved p
          WHERE p.model = model_name
            AND p.name = 'wte'
          ORDER BY p.token_id
          LIMIT 1;
     END IF;
 
-    IF d_model IS NULL THEN
+    IF effective_d_model IS NULL THEN
         RAISE EXCEPTION 'Missing token embeddings for model %', model_name;
     END IF;
 
-    IF vocab_size IS NULL THEN
+    IF effective_vocab IS NULL THEN
         SELECT COUNT(*)
-          INTO vocab_size
-          FROM llm_param p
+          INTO effective_vocab
+          FROM llm_param_resolved p
          WHERE p.model = model_name
            AND p.name = 'wte';
     END IF;
 
-    x := llm_embed(token_ids, model_name, d_model);
+    x := llm_embed(token_ids, model_name, effective_d_model);
 
     x := llm_forward_gpt2(
         x,
         model_name,
-        n_layer,
-        n_head,
+        effective_n_layer,
+        effective_n_head,
         seq_len,
-        d_model,
+        effective_d_model,
         dropout_p => 0.0::float4,
         training => false);
 
     SELECT string_agg(p.data::TEXT, '' ORDER BY p.token_id)::BYTEA
       INTO weight_matrix
-      FROM llm_param p
+      FROM llm_param_resolved p
      WHERE p.model = model_name
        AND p.name = 'wte';
 
@@ -733,7 +1218,7 @@ BEGIN
         RAISE EXCEPTION 'Missing token embeddings for model %', model_name;
     END IF;
 
-    RETURN pg_llm_matmul(x, weight_matrix, seq_len, d_model, vocab_size);
+    RETURN pg_llm_matmul(x, weight_matrix, seq_len, effective_d_model, effective_vocab);
 END;
 $$ LANGUAGE plpgsql;
 
@@ -754,18 +1239,69 @@ CREATE OR REPLACE FUNCTION llm_generate(
     max_tokens INT DEFAULT 64,
     temperature FLOAT4 DEFAULT 1.0,
     topk INT DEFAULT 50,
-    topp FLOAT4 DEFAULT 0.95)
+    topp FLOAT4 DEFAULT 0.95,
+    model_name TEXT DEFAULT 'gpt2-small',
+    eos_token INT DEFAULT 50256)
 RETURNS TEXT AS $$
 DECLARE
-    ids INT[] := llm_encode(prompt,'gpt2-small');
+    ids INT[] := COALESCE(llm_encode(prompt, model_name), ARRAY[]::INT[]);
     next_id INT;
 BEGIN
     FOR i IN 1..max_tokens LOOP
-        next_id := pg_llm_sample(llm_logits(ids), temperature, topk, topp);
-        ids := array_append(ids,next_id);
-        EXIT WHEN next_id=50256;
+        next_id := pg_llm_sample(llm_logits(ids, model_name), temperature, topk, topp);
+        ids := array_append(ids, next_id);
+        EXIT WHEN next_id = eos_token;
     END LOOP;
-    RETURN llm_decode(ids,'gpt2-small');
+    RETURN COALESCE(llm_decode(ids, model_name), '');
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION llm_generate_stream(
+    prompt TEXT,
+    max_tokens INT DEFAULT 64,
+    temperature FLOAT4 DEFAULT 1.0,
+    topk INT DEFAULT 50,
+    topp FLOAT4 DEFAULT 0.95,
+    model_name TEXT DEFAULT 'gpt2-small',
+    eos_token INT DEFAULT 50256)
+RETURNS TABLE(
+    step INT,
+    token_id INT,
+    token TEXT,
+    text TEXT,
+    is_complete BOOLEAN)
+AS $$
+DECLARE
+    ids INT[] := COALESCE(llm_encode(prompt, model_name), ARRAY[]::INT[]);
+    next_id INT;
+BEGIN
+    step := 0;
+    LOOP
+        EXIT WHEN step >= max_tokens;
+        step := step + 1;
+
+        next_id := pg_llm_sample(llm_logits(ids, model_name), temperature, topk, topp);
+        ids := array_append(ids, next_id);
+
+        token_id := next_id;
+        token := COALESCE(
+            (
+                SELECT v.token
+                  FROM llm_bpe_vocab v
+                 WHERE v.model = model_name
+                   AND v.token_id = next_id
+                 LIMIT 1
+            ),
+            ''
+        );
+        text := COALESCE(llm_decode(ids, model_name), '');
+        is_complete := next_id = eos_token OR step >= max_tokens;
+        RETURN NEXT;
+
+        EXIT WHEN next_id = eos_token;
+    END LOOP;
+
+    RETURN;
 END;
 $$ LANGUAGE plpgsql;
 

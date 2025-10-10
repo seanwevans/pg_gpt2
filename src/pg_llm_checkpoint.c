@@ -1,5 +1,6 @@
 #include "pg_llm.h"
 #include "lib/stringinfo.h"
+#include "catalog/pg_type.h"
 #include <ctype.h>
 #include <errno.h>
 #include <limits.h>
@@ -20,11 +21,279 @@ typedef struct npy_header_t
     Size    payload_bytes; /* total bytes for the tensor payload */
 } npy_header_t;
 
+typedef struct model_config_t
+{
+    const char *name;
+    int         n_layer;
+    int         n_head;
+    int         d_model;
+    int         n_positions;
+    int         vocab;
+} model_config_t;
+
 static void free_npy_header(npy_header_t *hdr);
 static ssize_t read_npz_entry(gzFile fp, npy_header_t *hdr);
 static void gzread_exact(gzFile fp, void *dest, Size nbytes, const char *context);
 static void parse_npy_header(const char *header, npy_header_t *hdr);
 static void gzwrite_exact(gzFile fp, const void *src, Size nbytes, const char *context);
+static Size mul_size(Size a, Size b, const char *context);
+static void check_shape_1d(const npy_header_t *hdr, Size expected_len,
+                           const model_config_t *cfg);
+static void check_shape_2d(const npy_header_t *hdr, Size expected_rows,
+                           Size expected_cols, const model_config_t *cfg);
+static void validate_block_tensor(const npy_header_t *hdr, const model_config_t *cfg);
+
+static Size
+mul_size(Size a, Size b, const char *context)
+{
+    if (a != 0 && b > SIZE_MAX / a)
+        ereport(ERROR,
+                (errmsg("model dimension overflow computing %s", context)));
+    return a * b;
+}
+
+static void
+load_model_config(const char *model, model_config_t *cfg)
+{
+    Datum       values[1];
+    Oid         argtypes[1] = {TEXTOID};
+    char        nulls[1] = {' '};
+    int         ret;
+    bool        isnull;
+
+    if (cfg == NULL)
+        ereport(ERROR, (errmsg("model configuration destination is NULL")));
+
+    values[0] = CStringGetTextDatum(model);
+    ret = SPI_execute_with_args(
+        "SELECT n_layer, n_head, d_model, n_positions, vocab "
+        "FROM llm_model_config WHERE model = $1",
+        1,
+        argtypes,
+        values,
+        nulls,
+        true,
+        1);
+
+    pfree(DatumGetPointer(values[0]));
+
+    if (ret != SPI_OK_SELECT)
+        ereport(ERROR,
+                (errmsg("failed to query llm_model_config (SPI_execute returned %d)", ret)));
+
+    if (SPI_processed != 1)
+        ereport(ERROR,
+                (errmsg("model \"%s\" is not registered in llm_model_config", model)));
+
+    cfg->name = model;
+    cfg->n_layer = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[0],
+                                               SPI_tuptable->tupdesc,
+                                               1,
+                                               &isnull));
+    if (isnull)
+        ereport(ERROR,
+                (errmsg("model \"%s\" has NULL n_layer in llm_model_config", model)));
+
+    cfg->n_head = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[0],
+                                              SPI_tuptable->tupdesc,
+                                              2,
+                                              &isnull));
+    if (isnull)
+        ereport(ERROR,
+                (errmsg("model \"%s\" has NULL n_head in llm_model_config", model)));
+
+    cfg->d_model = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[0],
+                                               SPI_tuptable->tupdesc,
+                                               3,
+                                               &isnull));
+    if (isnull)
+        ereport(ERROR,
+                (errmsg("model \"%s\" has NULL d_model in llm_model_config", model)));
+
+    cfg->n_positions = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[0],
+                                                   SPI_tuptable->tupdesc,
+                                                   4,
+                                                   &isnull));
+    if (isnull)
+        ereport(ERROR,
+                (errmsg("model \"%s\" has NULL n_positions in llm_model_config", model)));
+
+    cfg->vocab = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[0],
+                                             SPI_tuptable->tupdesc,
+                                             5,
+                                             &isnull));
+    if (isnull)
+        ereport(ERROR,
+                (errmsg("model \"%s\" has NULL vocab in llm_model_config", model)));
+
+    if (cfg->n_layer <= 0 || cfg->n_head <= 0 ||
+        cfg->d_model <= 0 || cfg->n_positions <= 0 || cfg->vocab <= 0)
+        ereport(ERROR,
+                (errmsg("model \"%s\" has non-positive dimensions in llm_model_config", model)));
+
+    if (cfg->d_model % cfg->n_head != 0)
+        ereport(ERROR,
+                (errmsg("model \"%s\" has d_model not divisible by n_head", model)));
+}
+
+static void
+check_shape_1d(const npy_header_t *hdr, Size expected_len, const model_config_t *cfg)
+{
+    if (hdr->ndim != 1 || hdr->shape == NULL)
+        ereport(ERROR,
+                (errmsg("tensor \"%s\" expected a 1-D shape for model \"%s\"",
+                        hdr->key, cfg->name)));
+
+    if (hdr->shape[0] != expected_len)
+        ereport(ERROR,
+                (errmsg("tensor \"%s\" has wrong length for model \"%s\"",
+                        hdr->key, cfg->name),
+                 errdetail("expected %zu elements, found %zu",
+                           (size_t) expected_len,
+                           (size_t) hdr->shape[0])));
+}
+
+static void
+check_shape_2d(const npy_header_t *hdr, Size expected_rows, Size expected_cols,
+               const model_config_t *cfg)
+{
+    if (hdr->ndim != 2 || hdr->shape == NULL)
+        ereport(ERROR,
+                (errmsg("tensor \"%s\" expected a 2-D shape for model \"%s\"",
+                        hdr->key, cfg->name)));
+
+    if (hdr->shape[0] != expected_rows || hdr->shape[1] != expected_cols)
+        ereport(ERROR,
+                (errmsg("tensor \"%s\" has wrong dimensions for model \"%s\"",
+                        hdr->key, cfg->name),
+                 errdetail("expected (%zu, %zu), found (%zu, %zu)",
+                           (size_t) expected_rows,
+                           (size_t) expected_cols,
+                           (size_t) hdr->shape[0],
+                           (size_t) hdr->shape[1])));
+}
+
+static void
+validate_block_tensor(const npy_header_t *hdr, const model_config_t *cfg)
+{
+    const char *name = hdr->key;
+    const char *suffix;
+    char       *endptr;
+    long        layer;
+
+    if (name == NULL)
+        ereport(ERROR, (errmsg("tensor entry missing name")));
+
+    if (strncmp(name, "h.", 2) != 0)
+        ereport(ERROR,
+                (errmsg("unexpected tensor \"%s\" in checkpoint for model \"%s\"",
+                        name, cfg->name)));
+
+    layer = strtol(name + 2, &endptr, 10);
+    if (endptr == name + 2 || layer < 0 || *endptr != '.')
+        ereport(ERROR,
+                (errmsg("malformed transformer block tensor name \"%s\"", name)));
+
+    if (layer >= cfg->n_layer)
+        ereport(ERROR,
+                (errmsg("tensor \"%s\" targets layer %ld but model \"%s\" has only %d layers",
+                        name, layer, cfg->name, cfg->n_layer)));
+
+    suffix = endptr + 1;
+
+    if (strcmp(suffix, "ln_1.weight") == 0 || strcmp(suffix, "ln_1.bias") == 0 ||
+        strcmp(suffix, "ln_2.weight") == 0 || strcmp(suffix, "ln_2.bias") == 0 ||
+        strcmp(suffix, "attn.c_proj.bias") == 0 || strcmp(suffix, "mlp.c_proj.bias") == 0)
+    {
+        check_shape_1d(hdr, (Size) cfg->d_model, cfg);
+        return;
+    }
+
+    if (strcmp(suffix, "attn.c_attn.weight") == 0)
+    {
+        check_shape_2d(hdr,
+                       (Size) cfg->d_model,
+                       mul_size((Size) cfg->d_model, (Size) 3,
+                                "attention qkv weight width"),
+                       cfg);
+        return;
+    }
+
+    if (strcmp(suffix, "attn.c_attn.bias") == 0)
+    {
+        check_shape_1d(hdr,
+                       mul_size((Size) cfg->d_model, (Size) 3,
+                                "attention qkv bias length"),
+                       cfg);
+        return;
+    }
+
+    if (strcmp(suffix, "attn.c_proj.weight") == 0)
+    {
+        check_shape_2d(hdr, (Size) cfg->d_model, (Size) cfg->d_model, cfg);
+        return;
+    }
+
+    if (strcmp(suffix, "mlp.c_fc.weight") == 0)
+    {
+        check_shape_2d(hdr,
+                       (Size) cfg->d_model,
+                       mul_size((Size) cfg->d_model, (Size) 4,
+                                "mlp fc weight width"),
+                       cfg);
+        return;
+    }
+
+    if (strcmp(suffix, "mlp.c_fc.bias") == 0)
+    {
+        check_shape_1d(hdr,
+                       mul_size((Size) cfg->d_model, (Size) 4,
+                                "mlp fc bias length"),
+                       cfg);
+        return;
+    }
+
+    if (strcmp(suffix, "mlp.c_proj.weight") == 0)
+    {
+        check_shape_2d(hdr,
+                       mul_size((Size) cfg->d_model, (Size) 4,
+                                "mlp proj weight height"),
+                       (Size) cfg->d_model,
+                       cfg);
+        return;
+    }
+
+    ereport(ERROR,
+            (errmsg("unexpected transformer tensor \"%s\" for model \"%s\"",
+                    name, cfg->name)));
+}
+
+static void
+validate_tensor_shape(const npy_header_t *hdr, const model_config_t *cfg)
+{
+    if (hdr->key == NULL)
+        ereport(ERROR, (errmsg("tensor entry missing name")));
+
+    if (strcmp(hdr->key, "wte") == 0)
+    {
+        check_shape_2d(hdr, (Size) cfg->vocab, (Size) cfg->d_model, cfg);
+        return;
+    }
+
+    if (strcmp(hdr->key, "wpe") == 0)
+    {
+        check_shape_2d(hdr, (Size) cfg->n_positions, (Size) cfg->d_model, cfg);
+        return;
+    }
+
+    if (strcmp(hdr->key, "ln_f.weight") == 0 || strcmp(hdr->key, "ln_f.bias") == 0)
+    {
+        check_shape_1d(hdr, (Size) cfg->d_model, cfg);
+        return;
+    }
+
+    validate_block_tensor(hdr, cfg);
+}
 
 PG_FUNCTION_INFO_V1(pg_llm_import_npz);
 
@@ -38,20 +307,36 @@ Datum pg_llm_import_npz(PG_FUNCTION_ARGS)
     text *model_t = PG_GETARG_TEXT_P(1);
     char *path = text_to_cstring(path_t);
     char *model = text_to_cstring(model_t);
-    gzFile fp;
+    gzFile fp = NULL;
+    model_config_t cfg;
 
-    SPI_connect();
+    if (SPI_connect() != SPI_OK_CONNECT)
+    {
+        pfree(path);
+        pfree(model);
+        ereport(ERROR,
+                (errmsg("SPI_connect failed in pg_llm_import_npz")));
+    }
 
     fp = gzopen(path, "rb");
     if (!fp)
     {
         SPI_finish();
+        pfree(path);
+        pfree(model);
         ereport(ERROR,
                 (errmsg("could not open %s", path)));
     }
 
     PG_TRY();
     {
+        load_model_config(model, &cfg);
+
+        fp = gzopen(path, "rb");
+        if (!fp)
+            ereport(ERROR,
+                    (errmsg("could not open %s", path)));
+
         while (true)
         {
             npy_header_t hdr;
@@ -86,6 +371,8 @@ Datum pg_llm_import_npz(PG_FUNCTION_ARGS)
                 ereport(ERROR,
                         (errmsg("payload size mismatch for entry \"%s\"", hdr.key)));
 
+            validate_tensor_shape(&hdr, &cfg);
+
             if ((Size) payload_bytes > MaxAllocSize - VARHDRSZ)
                 ereport(ERROR,
                         (errmsg("tensor \"%s\" too large to fit in memory", hdr.key)));
@@ -103,14 +390,22 @@ Datum pg_llm_import_npz(PG_FUNCTION_ARGS)
                              model, hdr.key);
             argtypes[0] = BYTEAOID;
             values[0] = PointerGetDatum(data);
-            SPI_execute_with_args(q.data, 1, argtypes, values, NULL, false, 0);
+            int spi_rc = SPI_execute_with_args(q.data, 1, argtypes, values, NULL, false, 0);
+            if (spi_rc != SPI_OK_INSERT && spi_rc != SPI_OK_INSERT_RETURNING && spi_rc != SPI_OK_UPDATE)
+                ereport(ERROR,
+                        (errmsg("failed to upsert tensor \"%s\" (SPI code %d)",
+                                hdr.key ? hdr.key : "<unknown>", spi_rc)));
 
             pfree(data);
             pfree(q.data);
             free_npy_header(&hdr);
         }
 
-        gzclose(fp);
+        int gz_rc = gzclose(fp);
+        fp = NULL;
+        if (gz_rc != Z_OK)
+            ereport(ERROR,
+                    (errmsg("gzclose failed while importing %s", path)));
         SPI_finish();
     }
     PG_CATCH();
@@ -118,9 +413,14 @@ Datum pg_llm_import_npz(PG_FUNCTION_ARGS)
         if (fp)
             gzclose(fp);
         SPI_finish();
+        pfree(path);
+        pfree(model);
         PG_RE_THROW();
     }
     PG_END_TRY();
+
+    pfree(path);
+    pfree(model);
 
     PG_RETURN_VOID();
 }

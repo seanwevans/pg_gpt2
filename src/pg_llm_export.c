@@ -22,7 +22,13 @@ pg_llm_export_npz(PG_FUNCTION_ARGS)
     Oid     argtypes[1];
     Datum   values[1];
 
-    SPI_connect();
+    if (SPI_connect() != SPI_OK_CONNECT)
+    {
+        pfree(path);
+        pfree(model);
+        ereport(ERROR,
+                (errmsg("SPI_connect failed in pg_llm_export_npz")));
+    }
 
     PG_TRY();
     {
@@ -39,7 +45,7 @@ pg_llm_export_npz(PG_FUNCTION_ARGS)
 
         spi_rc = SPI_execute_with_args(
             "SELECT p.name, p.data, t.shape "
-            "FROM llm_param p "
+            "FROM llm_param_resolved p "
             "LEFT JOIN llm_tensor_map m ON (m.model = p.model AND m.name = p.name AND m.token_id = p.token_id) "
             "LEFT JOIN llm_tensor_rt t ON (t.id = m.tensor_id) "
             "WHERE p.model = $1 "
@@ -99,8 +105,11 @@ pg_llm_export_npz(PG_FUNCTION_ARGS)
 
         pfree(DatumGetPointer(model_value));
 
-        gzclose(fp);
+        int gz_rc = gzclose(fp);
         fp = NULL;
+        if (gz_rc != Z_OK)
+            ereport(ERROR,
+                    (errmsg("gzclose failed while exporting %s", path)));
 
         SPI_finish();
     }
@@ -109,6 +118,8 @@ pg_llm_export_npz(PG_FUNCTION_ARGS)
         if (fp)
             gzclose(fp);
         SPI_finish();
+        pfree(path);
+        pfree(model);
         PG_RE_THROW();
     }
     PG_END_TRY();

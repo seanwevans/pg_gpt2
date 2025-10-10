@@ -1,23 +1,47 @@
 SET
 SET
-TRUNCATE TABLE
 CREATE FUNCTION
 CREATE FUNCTION
 CREATE FUNCTION
- setseed 
----------
- 
-(1 row)
-
-DO
-INSERT 0 100
+CREATE PROCEDURE
+CALL
  llm_train 
 -----------
  
 (1 row)
 
 DO
-            label            | logged_steps 
+              label              | passed
+--------------------------------+--------
+ tiny_e2e perplexity decreased  | t
+(1 row)
+
+SELECT 10
+CALL
+ llm_train 
+-----------
+
+(1 row)
+
+DO
+
+ llm_train
+-----------
+
+(1 row)
+
+ total_steps | min_step | max_step
+-------------+----------+----------
+          10 |        1 |       10
+(1 row)
+
+DO
+            label            | logged_steps
 ----------------------------+--------------
  tiny_e2e loss decreased    |           10
+(1 row)
+
+              label               | matching_steps
+---------------------------------+----------------
+ tiny_e2e reproducibility verified |             10
 (1 row)

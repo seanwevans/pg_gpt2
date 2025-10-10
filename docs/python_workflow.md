@@ -22,6 +22,11 @@ The resulting file can be imported into PostgreSQL via:
 SELECT pg_llm_import_npz('/mnt/models/gpt2-small.npz', 'gpt2-small');
 ```
 
+During import the extension verifies the checkpoint tensors against the
+dimensions recorded in `llm_model_config`. The default installation registers
+the GPT-2 small architecture; insert a row into that table for custom models
+before invoking `pg_llm_import_npz` so the validation can run.
+
 ## 2. Ingest Tokenizer Vocabulary
 
 With the weights in place, load the GPT-2 tokenizer vocabulary and merge rules
@@ -76,5 +81,40 @@ pip install transformers torch psycopg[binary]
 With the tables populated you can now train directly in SQL, for example:
 
 ```sql
-SELECT llm_train('gpt2-small', 1000, 12, 12, 768, 50257, 0.9, 0.999, 1e-8, 0.01, 2.5e-4, 2000);
+SELECT llm_train(
+    'gpt2-small',
+    1000,
+    beta1 => 0.9,
+    beta2 => 0.999,
+    eps => 1e-8,
+    wd => 0.01,
+    lr_max => 2.5e-4,
+    warmup => 2000
+);
+```
+
+The layer count, head count, hidden size, and vocabulary size are inferred from
+`llm_model_config`. Override them by supplying explicit values for the optional
+architecture arguments (`n_layer`, `n_head`, `D`, `vocab`) if you are
+experimenting with custom checkpoints.
+
+## Client-Side Generation Helpers
+
+Use :mod:`pg_llm_client` for convenience methods that expose temperature
+controls, beam search, and streaming token output:
+
+```python
+import psycopg
+from pg_llm_client import PGLLMClient
+
+with psycopg.connect("postgresql://postgres@localhost:5432/postgres") as conn:
+    client = PGLLMClient(conn)
+    print(client.generate("Hello from Postgres", temperature=0.6))
+
+    for event in client.stream("Streaming tokens", max_tokens=4):
+        print(event.step, event.token, event.text)
+
+    top_candidates = client.beam_search("Beam me", beam_width=2, max_tokens=6)
+    for candidate in top_candidates:
+        print(candidate.score, candidate.text)
 ```

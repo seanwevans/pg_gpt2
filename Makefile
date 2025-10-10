@@ -16,7 +16,10 @@ dropout \
 llm_train_e2e \
 llm_backprop_layers \
 llm_backprop_tied \
-llm_sampling
+llm_sampling \
+llm_long_sequences \
+llm_weight_sharing
+
 REGRESS_OPTS = --dlpath=$(abs_builddir)
 
 PG_CPPFLAGS += -I$(srcdir)/src

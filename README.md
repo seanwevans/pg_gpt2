@@ -33,6 +33,20 @@ If PostgreSQL is installed somewhere custom, set the `PG_CONFIG` environment var
 2. **Load the extension in a database.** Connect with `psql` and execute `CREATE EXTENSION pg_llm;` in the target database. This initializes all required tables, functions, and SQL entry points.
 3. **Verify availability.** Confirm the extension is active with either `\dx pg_llm` in `psql` or a query such as `SELECT * FROM pg_extension WHERE extname = 'pg_llm';`. Successful output indicates the extension is ready for the workflow described below.
 
+### Docker Image
+
+To simplify evaluation and demos you can run PostgreSQL with the `pg_gpt2` extension pre-installed using the provided Dockerfile.
+
+```bash
+# Build the image locally
+docker build -t pg-gpt2-demo .
+
+# Start PostgreSQL with pg_llm already installed in the default database
+docker run --rm -e POSTGRES_PASSWORD=secret -p 5432:5432 --name pg-gpt2 pg-gpt2-demo
+```
+
+The container reuses the official `postgres:16` entrypoint. On first start it creates the default database and automatically enables the `pg_llm` extension so that `psql` connections can immediately run the SQL workflows described below.
+
 ---
 
 ## Core Design Principles
@@ -64,6 +78,7 @@ If PostgreSQL is installed somewhere custom, set the `PG_CONFIG` environment var
 
 | Table | Purpose |
 |--------|----------|
+| `llm_model_config` | Registered model dimensions (layers, heads, embedding size, positions, vocab). |
 | `llm_param` | Model parameters, gradients, optimizer state. |
 | `llm_dataset` | Tokenized training sequences. |
 | `llm_tape` / `llm_tensor_rt` | Computational graph and runtime tensors for autograd. |
@@ -71,6 +86,12 @@ If PostgreSQL is installed somewhere custom, set the `PG_CONFIG` environment var
 | `llm_checkpoint` | Versioned checkpoint metadata and file paths. |
 | `llm_bpe_vocab` / `llm_bpe_merges` | GPT-2 tokenizer vocabulary and merge ranks. |
 | `llm_train_log` | Per-step learning rate and loss history. |
+
+---
+
+## Roadmap
+
+See [docs/roadmap.md](docs/roadmap.md) for the upcoming feature roadmap, including GPT-3 style architecture support, mixed-precision execution, and hardware acceleration milestones.
 
 ---
 
@@ -113,12 +134,18 @@ SELECT pg_llm_import_npz('/mnt/models/gpt2-small.npz', 'gpt2-small');
 ```
 
 Imports all pretrained GPT-2 weights into the `llm_param` table.
+`llm_model_config` tracks the expected architecture dimensions for each model
+and is consulted during import; `gpt2-small` is pre-registered, but custom
+models should insert their configuration before calling `pg_llm_import_npz`.
 
 ### Forward Pass and Inference
 
 ```sql
 -- Generate text directly in SQL
 SELECT llm_generate('Once upon a time', 80, 0.9, 40, 0.92);
+
+-- Stream tokens as they are produced (step, token_id, token, text, is_complete)
+SELECT * FROM llm_generate_stream('Once upon a time', 40, 0.8, 40, 0.95);
 ```
 
 ### Training
@@ -127,10 +154,9 @@ SELECT llm_generate('Once upon a time', 80, 0.9, 40, 0.92);
 -- Train for 10,000 steps on tokenized text dataset
 SELECT llm_train(
   'gpt2-small',
-  10000,        -- steps
-  12, 12, 768,  -- layers, heads, hidden size
-  50257,        -- vocab size
-  0.9, 0.999, 1e-8, 0.01, 2.5e-4, 2000
+  10000,
+  grad_workers => 4,
+  prune_workers => 4
 );
 ```
 
@@ -140,6 +166,23 @@ Every step performs:
 3. Gradient accumulation
 4. AdamW parameter updates
 5. Logging to `llm_train_log`
+
+`llm_train` will automatically read the layer count, attention heads, hidden size,
+and vocabulary size from `llm_model_config`. Provide overrides for custom
+experiments by passing explicit values for `n_layer`, `n_head`, `D`, or `vocab`
+when invoking the function.
+
+The training helpers expose knobs for multi-core cleanup work:
+
+- `grad_workers` sets the desired parallel worker count for `llm_accumulate_grads`,
+  allowing gradient materialisation from `llm_tensor_rt` into `llm_param` to leverage
+  PostgreSQL's parallel query engine.
+- `prune_workers` applies the same hinting to `llm_prune_autograd_state`, which clears
+  the autograd tape and runtime tensors between steps. Autograd tape pruning is safe
+  to parallelise because every runtime tensor row is independent, so this option simply
+  tunes planner settings before issuing the deletes.
+
+Both parameters default to `1` (no parallel workers) to preserve existing behaviour.
 
 ### Checkpointing
 
@@ -202,7 +245,9 @@ python scripts/prepare_dataset.py \
 ```
 
 An end-to-end walkthrough that stitches the helper scripts together is available
-in [docs/python_workflow.md](docs/python_workflow.md).
+in [docs/python_workflow.md](docs/python_workflow.md), and a fully annotated
+Jupyter notebook showing the SQL fine-tuning loop from data ingestion through
+generation lives at [docs/fine_tuning_workflow.ipynb](docs/fine_tuning_workflow.ipynb).
 
 ---
 
@@ -259,11 +304,43 @@ SELECT llm_encode('The database that dreamed of language.','gpt2-small');
 SELECT llm_generate('The database that dreamed of language', 40, 0.8, 40, 0.95);
 
 -- 4. Train or fine-tune
-SELECT llm_train('gpt2-small', 5000, 12, 12, 768, 50257);
+SELECT llm_train('gpt2-small', 5000);
 
 -- 5. Save checkpoint
 SELECT llm_checkpoint_save('gpt2-small','finetuned on corpus X');
 ```
+
+---
+
+## Python Client Utilities
+
+Client applications can connect to PostgreSQL using `psycopg` and drive the
+text-generation workflow directly from Python. The :mod:`pg_llm_client`
+package offers a high-level helper:
+
+```python
+import psycopg
+from pg_llm_client import PGLLMClient
+
+with psycopg.connect("postgresql://postgres@localhost:5432/postgres") as conn:
+    client = PGLLMClient(conn)
+
+    # Single completion with tuned sampling parameters
+    print(client.generate("The database that dreamed of language", temperature=0.7))
+
+    # Stream tokens as they arrive
+    for event in client.stream("Streaming from SQL", max_tokens=8):
+        print(event.text)
+
+    # Retrieve the top beam search candidates
+    beams = client.beam_search("Once upon a", beam_width=3, max_tokens=5)
+    for beam in beams:
+        print(beam.score, beam.text)
+```
+
+The helper wraps the SQL API so sampling temperature, beam width, and other
+parameters can be adjusted per request without hand-writing SQL in every
+client.
 
 ---
 
