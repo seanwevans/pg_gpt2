@@ -593,7 +593,9 @@ CREATE OR REPLACE FUNCTION llm_train_step(
     lr_max FLOAT4,
     warmup INT,
     total_steps INT,
-    grad_clip FLOAT4 DEFAULT NULL)
+    grad_clip FLOAT4 DEFAULT NULL,
+    grad_workers INT DEFAULT 1,
+    prune_workers INT DEFAULT 1)
 RETURNS FLOAT4 AS $$
 DECLARE
     seq INT[];
@@ -617,8 +619,7 @@ BEGIN
 
     lr := pg_llm_lr_schedule(step_count, warmup, total_steps, lr_max);
     -- Reset autograd state from the previous step
-    DELETE FROM llm_tape;
-    DELETE FROM llm_tensor_rt;
+    PERFORM llm_prune_autograd_state(prune_workers);
     DELETE FROM llm_autograd_mode;
 
     -- Populate cached tensors for the forward pass
@@ -637,7 +638,7 @@ BEGIN
     END IF;
 
     PERFORM llm_backprop(tape_top, model);
-    PERFORM llm_accumulate_grads(model);
+    PERFORM llm_accumulate_grads(model, grad_workers);
 
     UPDATE llm_param p
     SET (data, m, v, grad, step) = (
@@ -666,8 +667,7 @@ BEGIN
     VALUES(model, step_count, lr, loss);
 
     -- Free runtime autograd state eagerly so the next step starts clean
-    DELETE FROM llm_tape;
-    DELETE FROM llm_tensor_rt;
+    PERFORM llm_prune_autograd_state(prune_workers);
 
     RETURN loss;
 END;
@@ -727,7 +727,9 @@ CREATE OR REPLACE FUNCTION llm_train(
     wd FLOAT4 DEFAULT 0.01,
     lr_max FLOAT4 DEFAULT 2.5e-4,
     warmup INT DEFAULT 2000,
-    grad_clip FLOAT4 DEFAULT NULL)
+    grad_clip FLOAT4 DEFAULT NULL,
+    grad_workers INT DEFAULT 1,
+    prune_workers INT DEFAULT 1)
 RETURNS VOID AS $$
 DECLARE
     loss FLOAT4;
@@ -762,7 +764,9 @@ BEGIN
             dropout_p,
             beta1, beta2, eps, wd,
             lr_max, warmup, n_steps,
-            grad_clip);
+            grad_clip,
+            grad_workers,
+            prune_workers);
 
         RAISE NOTICE 'step %/% loss=%', i, n_steps, loss;
     END LOOP;
@@ -875,9 +879,17 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-CREATE OR REPLACE FUNCTION llm_accumulate_grads(p_model TEXT)
+CREATE OR REPLACE FUNCTION llm_accumulate_grads(p_model TEXT, p_workers INT DEFAULT 1)
 RETURNS VOID AS $$
+DECLARE
+    effective_workers INT := GREATEST(COALESCE(p_workers, 1), 1);
 BEGIN
+    IF effective_workers > 1 THEN
+        PERFORM set_config('max_parallel_workers_per_gather', effective_workers::TEXT, true);
+        PERFORM set_config('parallel_setup_cost', '0', true);
+        PERFORM set_config('parallel_tuple_cost', '0', true);
+    END IF;
+
     -- Clear stale gradients for this model
     UPDATE llm_param p
     SET grad = NULL
@@ -918,9 +930,24 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+CREATE OR REPLACE FUNCTION llm_prune_autograd_state(p_workers INT DEFAULT 1)
+RETURNS VOID AS $$
+DECLARE
+    effective_workers INT := GREATEST(COALESCE(p_workers, 1), 1);
+BEGIN
+    IF effective_workers > 1 THEN
+        PERFORM set_config('max_parallel_workers_per_gather', effective_workers::TEXT, true);
+        PERFORM set_config('parallel_setup_cost', '0', true);
+        PERFORM set_config('parallel_tuple_cost', '0', true);
+    END IF;
+
+    DELETE FROM llm_tape;
+    DELETE FROM llm_tensor_rt;
+END;
+$$ LANGUAGE plpgsql;
+
 BEGIN;
-  DELETE FROM llm_tape;
-  DELETE FROM llm_tensor_rt;
+  PERFORM llm_prune_autograd_state();
 
   -- Forward pass with autograd enabled
   INSERT INTO llm_autograd_mode VALUES(true);
