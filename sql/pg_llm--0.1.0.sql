@@ -512,8 +512,6 @@ DECLARE
 BEGIN
     IF effective_workers > 1 THEN
         PERFORM set_config('max_parallel_workers_per_gather', effective_workers::TEXT, true);
-        PERFORM set_config('max_parallel_workers', effective_workers::TEXT, true);
-        PERFORM set_config('max_parallel_maintenance_workers', effective_workers::TEXT, true);
         PERFORM set_config('parallel_setup_cost', '0', true);
         PERFORM set_config('parallel_tuple_cost', '0', true);
     END IF;
@@ -543,8 +541,6 @@ DECLARE
 BEGIN
     IF effective_workers > 1 THEN
         PERFORM set_config('max_parallel_workers_per_gather', effective_workers::TEXT, true);
-        PERFORM set_config('max_parallel_workers', effective_workers::TEXT, true);
-        PERFORM set_config('max_parallel_maintenance_workers', effective_workers::TEXT, true);
         PERFORM set_config('parallel_setup_cost', '0', true);
         PERFORM set_config('parallel_tuple_cost', '0', true);
     END IF;
