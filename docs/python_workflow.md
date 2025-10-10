@@ -83,3 +83,24 @@ With the tables populated you can now train directly in SQL, for example:
 ```sql
 SELECT llm_train('gpt2-small', 1000, 12, 12, 768, 50257, 0.9, 0.999, 1e-8, 0.01, 2.5e-4, 2000);
 ```
+
+## Client-Side Generation Helpers
+
+Use :mod:`pg_llm_client` for convenience methods that expose temperature
+controls, beam search, and streaming token output:
+
+```python
+import psycopg
+from pg_llm_client import PGLLMClient
+
+with psycopg.connect("postgresql://postgres@localhost:5432/postgres") as conn:
+    client = PGLLMClient(conn)
+    print(client.generate("Hello from Postgres", temperature=0.6))
+
+    for event in client.stream("Streaming tokens", max_tokens=4):
+        print(event.step, event.token, event.text)
+
+    top_candidates = client.beam_search("Beam me", beam_width=2, max_tokens=6)
+    for candidate in top_candidates:
+        print(candidate.score, candidate.text)
+```

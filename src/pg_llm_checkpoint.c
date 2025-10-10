@@ -310,7 +310,23 @@ Datum pg_llm_import_npz(PG_FUNCTION_ARGS)
     gzFile fp = NULL;
     model_config_t cfg;
 
-    SPI_connect();
+    if (SPI_connect() != SPI_OK_CONNECT)
+    {
+        pfree(path);
+        pfree(model);
+        ereport(ERROR,
+                (errmsg("SPI_connect failed in pg_llm_import_npz")));
+    }
+
+    fp = gzopen(path, "rb");
+    if (!fp)
+    {
+        SPI_finish();
+        pfree(path);
+        pfree(model);
+        ereport(ERROR,
+                (errmsg("could not open %s", path)));
+    }
 
     PG_TRY();
     {
@@ -374,14 +390,22 @@ Datum pg_llm_import_npz(PG_FUNCTION_ARGS)
                              model, hdr.key);
             argtypes[0] = BYTEAOID;
             values[0] = PointerGetDatum(data);
-            SPI_execute_with_args(q.data, 1, argtypes, values, NULL, false, 0);
+            int spi_rc = SPI_execute_with_args(q.data, 1, argtypes, values, NULL, false, 0);
+            if (spi_rc != SPI_OK_INSERT && spi_rc != SPI_OK_INSERT_RETURNING && spi_rc != SPI_OK_UPDATE)
+                ereport(ERROR,
+                        (errmsg("failed to upsert tensor \"%s\" (SPI code %d)",
+                                hdr.key ? hdr.key : "<unknown>", spi_rc)));
 
             pfree(data);
             pfree(q.data);
             free_npy_header(&hdr);
         }
 
-        gzclose(fp);
+        int gz_rc = gzclose(fp);
+        fp = NULL;
+        if (gz_rc != Z_OK)
+            ereport(ERROR,
+                    (errmsg("gzclose failed while importing %s", path)));
         SPI_finish();
     }
     PG_CATCH();
@@ -389,9 +413,14 @@ Datum pg_llm_import_npz(PG_FUNCTION_ARGS)
         if (fp)
             gzclose(fp);
         SPI_finish();
+        pfree(path);
+        pfree(model);
         PG_RE_THROW();
     }
     PG_END_TRY();
+
+    pfree(path);
+    pfree(model);
 
     PG_RETURN_VOID();
 }
