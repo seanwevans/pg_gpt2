@@ -33,6 +33,10 @@ If PostgreSQL is installed somewhere custom, set the `PG_CONFIG` environment var
 2. **Load the extension in a database.** Connect with `psql` and execute `CREATE EXTENSION pg_llm;` in the target database. This initializes all required tables, functions, and SQL entry points.
 3. **Verify availability.** Confirm the extension is active with either `\dx pg_llm` in `psql` or a query such as `SELECT * FROM pg_extension WHERE extname = 'pg_llm';`. Successful output indicates the extension is ready for the workflow described below.
 
+## Reproducing GPT-2 Results
+
+Follow the [reproduction playbook](docs/reproducing_gpt2.md) for a step-by-step guide that mirrors the original GPT-2 training, evaluation, and sampling pipeline entirely within PostgreSQL.
+
 ### Docker Image
 
 To simplify evaluation and demos you can run PostgreSQL with the `pg_gpt2` extension pre-installed using the provided Dockerfile.
