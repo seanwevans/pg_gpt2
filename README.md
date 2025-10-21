@@ -1,5 +1,7 @@
 # pg_gpt2
 
+<img width="256" alt="It was the best of times, it was the BLURST of times?!?!" src="https://github.com/user-attachments/assets/a4a059f1-d7c0-40df-bdf3-e95d387c27bd" />
+
 **pg_gpt2** is a complete implementation of the GPT-2 architecture *entirely inside PostgreSQL*.
 It extends the database with tensor algebra, automatic differentiation, AdamW optimization, checkpointing, and a Byte-Pair Encoding tokenizer — allowing end-to-end training and text generation purely through SQL and C extensions.
 
