@@ -36,7 +36,7 @@ static ssize_t read_npz_entry(gzFile fp, npy_header_t *hdr);
 static void gzread_exact(gzFile fp, void *dest, Size nbytes, const char *context);
 static void parse_npy_header(const char *header, npy_header_t *hdr);
 static void gzwrite_exact(gzFile fp, const void *src, Size nbytes, const char *context);
-static Size mul_size(Size a, Size b, const char *context);
+static Size checked_mul_size(Size a, Size b, const char *context);
 static void check_shape_1d(const npy_header_t *hdr, Size expected_len,
                            const model_config_t *cfg);
 static void check_shape_2d(const npy_header_t *hdr, Size expected_rows,
@@ -44,7 +44,7 @@ static void check_shape_2d(const npy_header_t *hdr, Size expected_rows,
 static void validate_block_tensor(const npy_header_t *hdr, const model_config_t *cfg);
 
 static Size
-mul_size(Size a, Size b, const char *context)
+checked_mul_size(Size a, Size b, const char *context)
 {
     if (a != 0 && b > SIZE_MAX / a)
         ereport(ERROR,
@@ -213,7 +213,7 @@ validate_block_tensor(const npy_header_t *hdr, const model_config_t *cfg)
     {
         check_shape_2d(hdr,
                        (Size) cfg->d_model,
-                       mul_size((Size) cfg->d_model, (Size) 3,
+                       checked_mul_size((Size) cfg->d_model, (Size) 3,
                                 "attention qkv weight width"),
                        cfg);
         return;
@@ -222,7 +222,7 @@ validate_block_tensor(const npy_header_t *hdr, const model_config_t *cfg)
     if (strcmp(suffix, "attn.c_attn.bias") == 0)
     {
         check_shape_1d(hdr,
-                       mul_size((Size) cfg->d_model, (Size) 3,
+                       checked_mul_size((Size) cfg->d_model, (Size) 3,
                                 "attention qkv bias length"),
                        cfg);
         return;
@@ -238,7 +238,7 @@ validate_block_tensor(const npy_header_t *hdr, const model_config_t *cfg)
     {
         check_shape_2d(hdr,
                        (Size) cfg->d_model,
-                       mul_size((Size) cfg->d_model, (Size) 4,
+                       checked_mul_size((Size) cfg->d_model, (Size) 4,
                                 "mlp fc weight width"),
                        cfg);
         return;
@@ -247,7 +247,7 @@ validate_block_tensor(const npy_header_t *hdr, const model_config_t *cfg)
     if (strcmp(suffix, "mlp.c_fc.bias") == 0)
     {
         check_shape_1d(hdr,
-                       mul_size((Size) cfg->d_model, (Size) 4,
+                       checked_mul_size((Size) cfg->d_model, (Size) 4,
                                 "mlp fc bias length"),
                        cfg);
         return;
@@ -256,7 +256,7 @@ validate_block_tensor(const npy_header_t *hdr, const model_config_t *cfg)
     if (strcmp(suffix, "mlp.c_proj.weight") == 0)
     {
         check_shape_2d(hdr,
-                       mul_size((Size) cfg->d_model, (Size) 4,
+                       checked_mul_size((Size) cfg->d_model, (Size) 4,
                                 "mlp proj weight height"),
                        (Size) cfg->d_model,
                        cfg);
