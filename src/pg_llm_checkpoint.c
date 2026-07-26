@@ -332,11 +332,6 @@ Datum pg_llm_import_npz(PG_FUNCTION_ARGS)
     {
         load_model_config(model, &cfg);
 
-        fp = gzopen(path, "rb");
-        if (!fp)
-            ereport(ERROR,
-                    (errmsg("could not open %s", path)));
-
         while (true)
         {
             npy_header_t hdr;
