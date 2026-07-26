@@ -16,6 +16,29 @@ compare_desc_float(const void *a, const void *b)
     return 0;
 }
 
+/*
+ * Order token indices by descending probability, breaking ties by ascending
+ * index so the ordering is deterministic. Used with qsort_arg (arg is the
+ * probability array) to sort candidates for top-p pruning in O(n log n).
+ */
+static int
+compare_idx_by_prob_desc(const void *a, const void *b, void *arg)
+{
+    const float *p = (const float *) arg;
+    int ia = *(const int *) a;
+    int ib = *(const int *) b;
+
+    if (p[ia] < p[ib])
+        return 1;
+    if (p[ia] > p[ib])
+        return -1;
+    if (ia < ib)
+        return -1;
+    if (ia > ib)
+        return 1;
+    return 0;
+}
+
 PG_FUNCTION_INFO_V1(pg_llm_sample);
 
 /*
@@ -69,10 +92,8 @@ Datum pg_llm_sample(PG_FUNCTION_ARGS)
         float cum = 0;
         float s = 0;
         for(int i=0;i<n;++i) idx[i]=i;
-        /* sort indices by prob desc */
-        for(int i=0;i<n-1;++i)
-            for(int j=i+1;j<n;++j)
-                if(p[idx[j]]>p[idx[i]]){int t=idx[i];idx[i]=idx[j];idx[j]=t;}
+        /* sort indices by prob desc (O(n log n) instead of O(n^2)) */
+        qsort_arg(idx, n, sizeof(int), compare_idx_by_prob_desc, p);
         for(int k=0;k<n;++k){
             cum+=p[idx[k]];
             if(cum>topp){
