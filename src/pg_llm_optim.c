@@ -179,6 +179,13 @@ Datum pg_llm_lr_schedule(PG_FUNCTION_ARGS)
         lr = lr_max * (float)step / (float)warmup;
     else {
         float progress = (float)(step - warmup) / (float)(total - warmup);
+        /*
+         * Clamp progress to the [0, 1] cosine half-period. Past the final
+         * step the raw ratio exceeds 1.0, which would send cos() back up and
+         * make the learning rate rise again after decaying to its floor.
+         */
+        if (progress > 1.0f)
+            progress = 1.0f;
         lr = 0.5f * lr_max * (1.0f + cosf(M_PI * progress));
     }
     PG_RETURN_FLOAT4(lr);
