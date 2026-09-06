@@ -41,6 +41,19 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential postgresql-16 postgresql-server-dev-16
 
+      - name: Install the clang PGXS builds bitcode with
+        # PGXS emits LLVM bitcode for JIT inlining using the exact clang
+        # recorded in Makefile.global. Without it `make` fails after the shared
+        # library has already linked, so read the version rather than pinning
+        # one that only happens to match today's runner image.
+        run: |
+          makefile_global="$(pg_config --pgxs | sed 's#/makefiles/pgxs\.mk$#/Makefile.global#')"
+          clang_bin="$(sed -n 's/^CLANG = *//p' "$makefile_global")"
+          if [ -n "$clang_bin" ] && [ ! -x "$clang_bin" ]; then
+            sudo apt-get install -y "$(basename "$clang_bin")"
+          fi
+          "$(basename "${clang_bin:-clang}")" --version
+
       - name: Build and install the extension
         run: |
           make
