@@ -1,0 +1,80 @@
+# Full pg_gpt2 chat stack: PostgreSQL with the extension installed, plus the
+# HTTP endpoint the GitHub Pages chat UI talks to.
+#
+#   docker compose up --build -d
+#   docker compose run --rm provision           # tokenizer + weights
+#   curl localhost:8000/healthz
+#
+# See docs/deployment.md for putting this behind a public HTTPS hostname.
+
+name: pg-gpt2
+
+services:
+  db:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-pg_gpt2}
+      POSTGRES_DB: ${POSTGRES_DB:-pg_gpt2}
+      # GPT-2 activations are large; give the executor room to work.
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+    command:
+      - postgres
+      - -c
+      - shared_buffers=2GB
+      - -c
+      - work_mem=512MB
+      - -c
+      - maintenance_work_mem=1GB
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Drop gpt2 vocab.json / merges.txt / *.npz here to import them.
+      - ./models:/mnt/models:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-pg_gpt2}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  api:
+    build:
+      context: .
+      dockerfile: docker/api.Dockerfile
+    environment:
+      PG_GPT2_DSN: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-pg_gpt2}@db:5432/${POSTGRES_DB:-pg_gpt2}
+      PG_GPT2_MODEL: ${PG_GPT2_MODEL:-gpt2-small}
+      PG_GPT2_MAX_TOKENS: ${PG_GPT2_MAX_TOKENS:-64}
+      # Restrict this to your GitHub Pages origin once you know it, e.g.
+      # https://seanwevans.github.io
+      PG_GPT2_CORS_ORIGINS: ${PG_GPT2_CORS_ORIGINS:-*}
+      PG_GPT2_RATE_LIMIT_PER_MINUTE: ${PG_GPT2_RATE_LIMIT_PER_MINUTE:-20}
+    ports:
+      - "${PG_GPT2_PORT:-8000}:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # One-shot helper: loads the tokenizer and either imports real GPT-2 weights
+  # or initialises a small random model so the endpoint has something to serve.
+  provision:
+    build:
+      context: .
+      dockerfile: docker/provision.Dockerfile
+    environment:
+      PG_GPT2_DSN: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-pg_gpt2}@db:5432/${POSTGRES_DB:-pg_gpt2}
+      PG_GPT2_MODEL: ${PG_GPT2_MODEL:-gpt2-small}
+      PG_GPT2_WEIGHTS: ${PG_GPT2_WEIGHTS:-}
+      PG_GPT2_VOCAB: ${PG_GPT2_VOCAB:-/mnt/models/vocab.json}
+      PG_GPT2_MERGES: ${PG_GPT2_MERGES:-/mnt/models/merges.txt}
+    volumes:
+      - ./models:/mnt/models:ro
+    depends_on:
+      db:
+        condition: service_healthy
+    profiles: ["provision"]
+
+volumes:
+  pgdata:

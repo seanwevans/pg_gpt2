@@ -213,7 +213,7 @@ insert_tensor_rt(bytea *tensor, int ndims, const int *dims, bool requires_grad)
         argtypes,
         values,
         nulls,
-        true,
+        false,          /* this statement writes, so it cannot be read-only */
         1);
 
     if (ret != SPI_OK_INSERT_RETURNING || SPI_processed != 1)

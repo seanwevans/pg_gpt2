@@ -10,3 +10,7 @@ regression.out
 tmp_check/
 tmp_check_iso/
 output_iso/
+
+# Python bytecode
+__pycache__/
+*.py[cod]

@@ -276,6 +276,9 @@ Datum pg_llm_layernorm(PG_FUNCTION_ARGS)
     float eps = PG_GETARG_FLOAT4(3);
 
     int n = float_length(x_b, "pg_llm_layernorm");
+    int width;
+    int rows;
+    int row;
     float *x;
     float *gamma;
     float *beta;
@@ -289,10 +292,21 @@ Datum pg_llm_layernorm(PG_FUNCTION_ARGS)
     gamma = as_float(gamma_b);
     beta = as_float(beta_b);
 
-    (void) float_length(gamma_b, "pg_llm_layernorm");
-    (void) float_length(beta_b, "pg_llm_layernorm");
-    ensure_same_size(x_b, gamma_b, "pg_llm_layernorm");
-    ensure_same_size(x_b, beta_b, "pg_llm_layernorm");
+    width = float_length(gamma_b, "pg_llm_layernorm");
+    ensure_same_size(gamma_b, beta_b, "pg_llm_layernorm");
+
+    /*
+     * LayerNorm normalizes over the last dimension only. gamma/beta carry that
+     * dimension, so an input holding several tokens is treated as a stack of
+     * rows of that width and each row is normalized independently. When gamma
+     * spans the whole input this reduces to a single row.
+     */
+    if (width == 0 || n % width != 0)
+        ereport(ERROR,
+                (errmsg("pg_llm_layernorm input of %d elements is not a multiple "
+                        "of the %d-element gamma/beta", n, width)));
+
+    rows = n / width;
 
     out = bytea_same_size(x_b);
     y = as_float(out);
@@ -305,12 +319,26 @@ Datum pg_llm_layernorm(PG_FUNCTION_ARGS)
         PG_TRY();
         {
             int dims[1] = {n};
+            int param_dims[1] = {width};
             int input_ids[3];
-            input_ids[0] = pg_llm_autograd_track_tensor(x_b, 1, dims, true);
-            input_ids[1] = pg_llm_autograd_track_tensor(gamma_b, 1, dims, true);
-            input_ids[2] = pg_llm_autograd_track_tensor(beta_b, 1, dims, true);
 
-            pg_llm_layernorm_forward(x, gamma, beta, n, eps, y);
+            if (rows != 1)
+                ereport(ERROR,
+                        (errmsg("pg_llm_layernorm cannot record a tape for a "
+                                "%d-row input; the backward pass expects gamma "
+                                "and beta to span the whole tensor", rows)));
+
+            input_ids[0] = pg_llm_autograd_track_tensor(x_b, 1, dims, true);
+            input_ids[1] = pg_llm_autograd_track_tensor(gamma_b, 1, param_dims, true);
+            input_ids[2] = pg_llm_autograd_track_tensor(beta_b, 1, param_dims, true);
+
+            for (row = 0; row < rows; ++row)
+                pg_llm_layernorm_forward(x + (size_t) row * width,
+                                         gamma,
+                                         beta,
+                                         width,
+                                         eps,
+                                         y + (size_t) row * width);
 
             int output_id = pg_llm_autograd_track_tensor(out, 1, dims, true);
             char *extra = psprintf("{\"eps\":%.9g,\"gamma_id\":%d,\"beta_id\":%d}",
@@ -328,7 +356,13 @@ Datum pg_llm_layernorm(PG_FUNCTION_ARGS)
     }
     else
     {
-        pg_llm_layernorm_forward(x, gamma, beta, n, eps, y);
+        for (row = 0; row < rows; ++row)
+            pg_llm_layernorm_forward(x + (size_t) row * width,
+                                     gamma,
+                                     beta,
+                                     width,
+                                     eps,
+                                     y + (size_t) row * width);
     }
 
     PG_RETURN_BYTEA_P(out);

@@ -26,3 +26,56 @@ jobs:
       - name: Build extension
         run: |
           make
+
+  # Proves the extension installs into a real cluster and can generate text
+  # end to end: tokenizer, embeddings, forward pass, sampling and decoding.
+  integration:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install PostgreSQL and build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential postgresql-16 postgresql-server-dev-16
+
+      - name: Build and install the extension
+        run: |
+          make
+          sudo make install
+
+      - name: Start PostgreSQL
+        run: |
+          sudo systemctl start postgresql@16-main || sudo pg_ctlcluster 16 main start
+          sudo -u postgres psql -c "ALTER USER postgres PASSWORD 'postgres';"
+          sudo -u postgres createdb pg_gpt2_ci
+
+      - name: Create the extension
+        run: |
+          PGPASSWORD=postgres psql -h localhost -U postgres -d pg_gpt2_ci \
+            -v ON_ERROR_STOP=1 -c 'CREATE EXTENSION pg_llm;'
+
+      - name: Install Python dependencies
+        run: python -m pip install --upgrade "psycopg[binary]" numpy
+
+      - name: Run the generation smoke test
+        run: |
+          python scripts/smoke_test.py \
+            --dsn "postgresql://postgres:postgres@localhost:5432/pg_gpt2_ci"
+
+  endpoint:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install endpoint dependencies
+        run: python -m pip install --upgrade -r server/requirements.txt
+
+      - name: Import the application
+        # Catches syntax errors and bad imports in the HTTP layer without
+        # needing a database.
+        run: python -c "from server.app import app; print(app.title, app.version)"

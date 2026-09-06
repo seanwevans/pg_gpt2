@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pg_gpt2 — chat with a transformer running inside PostgreSQL</title>
+<meta name="description" content="A chat front-end for pg_gpt2: GPT-2 inference executed entirely as SQL inside PostgreSQL.">
+<link rel="stylesheet" href="./styles.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🐘</text></svg>">
+</head>
+<body>
+
+<header>
+  <div class="wrap">
+    <h1><code>pg_gpt2</code> <span>chat</span></h1>
+    <p class="tagline">Every token below is produced by a forward pass written in SQL, executing inside PostgreSQL.</p>
+  </div>
+</header>
+
+<main class="wrap">
+  <div class="status">
+    <span class="dot" id="dot"></span>
+    <span id="status-text">Checking endpoint…</span>
+    <span id="status-model"></span>
+  </div>
+
+  <div id="setup" class="banner" hidden>
+    <strong>No endpoint configured</strong>
+    GitHub Pages serves static files only, so this page needs a running
+    <code>pg_gpt2</code> instance to talk to. Start one and point this page at it:
+    <pre>git clone https://github.com/seanwevans/pg_gpt2
+cd pg_gpt2
+docker compose up --build -d
+docker compose run --rm provision</pre>
+    Then set the endpoint below to <code>http://localhost:8000</code>.
+  </div>
+
+  <div class="panel">
+    <div id="transcript" aria-live="polite">
+      <div class="msg model">
+        <span class="who">pg_gpt2</span>
+        <span class="body">Send a prompt and the database will continue it.</span>
+      </div>
+    </div>
+  </div>
+
+  <form id="composer">
+    <textarea id="prompt" rows="1" placeholder="Once upon a time…" autocomplete="off"></textarea>
+    <button type="submit" id="send">Send</button>
+  </form>
+
+  <details class="settings" id="settings">
+    <summary>Endpoint &amp; sampling settings</summary>
+    <div class="panel grid">
+      <div class="field wide">
+        <label for="endpoint">Endpoint base URL</label>
+        <input id="endpoint" type="url" placeholder="http://localhost:8000" spellcheck="false">
+      </div>
+      <div class="field">
+        <label for="model">Model</label>
+        <select id="model"><option value="">(server default)</option></select>
+      </div>
+      <div class="field">
+        <label for="max_tokens">Max tokens <span id="max_tokens_v"></span></label>
+        <input id="max_tokens" type="range" min="1" max="128" step="1" value="32">
+      </div>
+      <div class="field">
+        <label for="temperature">Temperature <span id="temperature_v"></span></label>
+        <input id="temperature" type="range" min="0.1" max="1.5" step="0.05" value="0.8">
+      </div>
+      <div class="field">
+        <label for="top_k">Top-k <span id="top_k_v"></span></label>
+        <input id="top_k" type="range" min="0" max="200" step="1" value="40">
+      </div>
+      <div class="field">
+        <label for="top_p">Top-p <span id="top_p_v"></span></label>
+        <input id="top_p" type="range" min="0.1" max="1" step="0.01" value="0.95">
+      </div>
+      <div class="field wide">
+        <button type="button" class="ghost" id="reconnect">Reconnect</button>
+        <span class="hint">
+          Settings are stored in this browser only. You can also link a preset endpoint:
+          <code>?endpoint=https://your-host</code>
+        </span>
+      </div>
+    </div>
+  </details>
+</main>
+
+<footer class="wrap">
+  <p>
+    <a href="https://github.com/seanwevans/pg_gpt2">seanwevans/pg_gpt2</a> —
+    GPT-2 implemented as PostgreSQL tables and C kernels.
+    This page is static; generation happens on whatever endpoint you point it at.
+  </p>
+</footer>
+
+<script src="./chat.js"></script>
+</body>
+</html>

@@ -39,6 +39,30 @@ If PostgreSQL is installed somewhere custom, set the `PG_CONFIG` environment var
 
 Follow the [reproduction playbook](docs/reproducing_gpt2.md) for a step-by-step guide that mirrors the original GPT-2 training, evaluation, and sampling pipeline entirely within PostgreSQL.
 
+### Chat Endpoint and GitHub Pages UI
+
+To talk to a model instead of writing SQL, the repository ships a small HTTP
+endpoint (`server/`) and a static chat page (`site/`) that is published to
+GitHub Pages:
+
+```bash
+docker compose up --build -d          # PostgreSQL + pg_llm, and the HTTP API
+docker compose run --rm provision     # tokenizer + weights (random model if none given)
+curl localhost:8000/healthz
+```
+
+```bash
+curl -X POST localhost:8000/v1/chat \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"The database that dreamed of language","max_tokens":32}'
+```
+
+`POST /v1/chat/stream` returns the same completion as Server-Sent Events, one
+event per sampled token. GitHub Pages is static hosting and cannot run
+PostgreSQL, so the published page is a client only — it points at whatever
+instance you stand up. See [docs/deployment.md](docs/deployment.md) for the
+full walkthrough, including TLS and CORS.
+
 ### Docker Image
 
 To simplify evaluation and demos you can run PostgreSQL with the `pg_gpt2` extension pre-installed using the provided Dockerfile.
@@ -150,6 +174,9 @@ models should insert their configuration before calling `pg_llm_import_npz`.
 -- Generate text directly in SQL
 SELECT llm_generate('Once upon a time', 80, 0.9, 40, 0.92);
 
+-- Sample a single next token for an existing sequence (one autoregressive step)
+SELECT llm_next_token(llm_encode('Once upon a', 'gpt2-small'), 'gpt2-small', 0.9, 40, 0.92);
+
 -- Stream tokens as they are produced (step, token_id, token, text, is_complete)
 SELECT * FROM llm_generate_stream('Once upon a time', 40, 0.8, 40, 0.95);
 ```
@@ -220,6 +247,7 @@ calling the SQL functions above. All scripts live under `scripts/`.
 | Script | Purpose |
 |--------|---------|
 | `convert_gpt2_checkpoint.py` | Download/convert a HuggingFace GPT-2 checkpoint into the gzip-based `.npz` container expected by `pg_llm_import_npz`. |
+| `init_model.py` | Register a model and fill `llm_param` with random weights — brings up a working instance without a checkpoint download. |
 | `ingest_tokenizer.py` | Load `vocab.json` and `merges.txt` tokenizer assets into `llm_bpe_vocab`/`llm_bpe_merges` using a PostgreSQL connection. |
 | `prepare_dataset.py` | Tokenize raw text files with the GPT-2 tokenizer and populate `llm_dataset` with fixed-length `(tokens, target)` arrays. |
 

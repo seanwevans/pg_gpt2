@@ -1,0 +1,4 @@
+# Tokenizer and checkpoint files are downloaded, not committed.
+*
+!.gitignore
+!README.md
