@@ -66,9 +66,8 @@ def ingest_vocab(conn: psycopg.Connection, model: str, rows: Iterable[Tuple[str,
             """
             INSERT INTO llm_bpe_vocab(model, token_id, token, score, bytes)
             VALUES %s
-            ON CONFLICT (token_id) DO UPDATE
-            SET model = EXCLUDED.model,
-                token = EXCLUDED.token,
+            ON CONFLICT (model, token_id) DO UPDATE
+            SET token = EXCLUDED.token,
                 score = EXCLUDED.score,
                 bytes = EXCLUDED.bytes;
             """,
@@ -84,9 +83,8 @@ def ingest_merges(conn: psycopg.Connection, model: str, rows: Iterable[Tuple[str
             """
             INSERT INTO llm_bpe_merges(model, rank, "left", "right", pair)
             VALUES %s
-            ON CONFLICT (rank) DO UPDATE
-            SET model = EXCLUDED.model,
-                "left" = EXCLUDED."left",
+            ON CONFLICT (model, rank) DO UPDATE
+            SET "left" = EXCLUDED."left",
                 "right" = EXCLUDED."right",
                 pair = EXCLUDED.pair;
             """,

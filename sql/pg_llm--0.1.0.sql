@@ -208,7 +208,7 @@ CREATE OR REPLACE VIEW llm_param_resolved AS
 CREATE OR REPLACE FUNCTION llm_share_param(
     source_model TEXT,
     source_name TEXT,
-    source_token_id INT DEFAULT 0,
+    source_token_id INT,
     target_model TEXT,
     target_name TEXT DEFAULT NULL,
     target_token_id INT DEFAULT NULL)
@@ -303,6 +303,13 @@ CREATE UNLOGGED TABLE llm_tensor (
     data BYTEA,
     shape INT[],
     requires_grad BOOL DEFAULT false
+);
+
+-- Records which model currently owns the shared llm_tensor cache so that the
+-- inference path can skip re-materialising unchanged weights.
+CREATE UNLOGGED TABLE llm_tensor_owner (
+    singleton BOOLEAN PRIMARY KEY DEFAULT true CHECK (singleton),
+    model     TEXT NOT NULL
 );
 
 -- Single-row toggle to enable/disable autograd recording during forward passes
@@ -470,21 +477,27 @@ BEGIN
                 i, octet_length(b_proj), expected_proj_bytes, per_token_proj_bytes;
         END IF;
 
-        PERFORM pg_llm_autograd_map_param(
-            model,
-            format('h.%s.mlp.c_fc.bias', i),
-            0,
-            b_fc_full,
-            ARRAY[octet_length(b_fc_full) / 4]
-        );
+        -- The broadcast biases are fresh buffers, so they need their own
+        -- runtime ids for gradients to reach llm_param.  Inference never reads
+        -- those ids back, and mapping them there would grow llm_tensor_rt by a
+        -- row per layer per generated token, so only do this while recording.
+        IF EXISTS (SELECT 1 FROM llm_autograd_mode m WHERE m.flag) THEN
+            PERFORM pg_llm_autograd_map_param(
+                model,
+                format('h.%s.mlp.c_fc.bias', i),
+                0,
+                b_fc_full,
+                ARRAY[octet_length(b_fc_full) / 4]
+            );
 
-        PERFORM pg_llm_autograd_map_param(
-            model,
-            format('h.%s.mlp.c_proj.bias', i),
-            0,
-            b_proj_full,
-            ARRAY[octet_length(b_proj_full) / 4]
-        );
+            PERFORM pg_llm_autograd_map_param(
+                model,
+                format('h.%s.mlp.c_proj.bias', i),
+                0,
+                b_proj_full,
+                ARRAY[octet_length(b_proj_full) / 4]
+            );
+        END IF;
 
         x := llm_block_forward(
             x,
@@ -579,9 +592,9 @@ BEGIN
     --    runtime id must be registered via pg_llm_autograd_map_param so the
     --    logits gradient is accumulated back into each `wte` row.
     logits := pg_llm_matmul(x,
-        (SELECT string_agg(p.data::TEXT, '' ORDER BY p.token_id)::BYTEA
+        (SELECT string_agg(p.data, ''::BYTEA ORDER BY p.token_id)
          FROM llm_param_resolved p
-         WHERE p.model = model AND p.name = 'wte'),
+         WHERE p.model = llm_loss.model AND p.name = 'wte'),
         array_length(tokens,1), D, vocab);
 
     -- 4. Compute loss per token
@@ -602,13 +615,13 @@ CREATE OR REPLACE FUNCTION llm_train_step(
     D INT,
     vocab INT,
     dropout_p FLOAT4 DEFAULT 0.1,
-    beta1 FLOAT4,
-    beta2 FLOAT4,
-    eps FLOAT4,
-    wd FLOAT4,
-    lr_max FLOAT4,
-    warmup INT,
-    total_steps INT,
+    beta1 FLOAT4 DEFAULT 0.9,
+    beta2 FLOAT4 DEFAULT 0.999,
+    eps FLOAT4 DEFAULT 1e-8,
+    wd FLOAT4 DEFAULT 0.01,
+    lr_max FLOAT4 DEFAULT 2.5e-4,
+    warmup INT DEFAULT 2000,
+    total_steps INT DEFAULT 10000,
     grad_clip FLOAT4 DEFAULT NULL,
     grad_workers INT DEFAULT 1,
     prune_workers INT DEFAULT 1)
@@ -689,7 +702,7 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-CREATE OR REPLACE FUNCTION llm_embed(tokens INT[], model TEXT, D INT)
+CREATE OR REPLACE FUNCTION llm_embed(tokens INT[], p_model TEXT, D INT)
 RETURNS BYTEA AS $$
 DECLARE
     out BYTEA;
@@ -704,29 +717,29 @@ BEGIN
 
     -- Flatten summed token and positional embeddings
     SELECT string_agg(
-               pg_llm_add(wte.data, wpe.data)::TEXT,
-               '' ORDER BY t.ord
-           )::BYTEA,
+               pg_llm_add(wte.data, wpe.data),
+               ''::BYTEA ORDER BY t.ord
+           ),
            COUNT(*)
       INTO out, matched
       FROM unnest(tokens) WITH ORDINALITY AS t(token_id, ord)
       JOIN llm_param_resolved wte
-        ON wte.model = model
+        ON wte.model = p_model
        AND wte.name = 'wte'
        AND wte.token_id = t.token_id
       JOIN llm_param_resolved wpe
-        ON wpe.model = model
+        ON wpe.model = p_model
        AND wpe.name = 'wpe'
        AND wpe.token_id = t.ord - 1;
 
     IF out IS NULL THEN
-        RAISE EXCEPTION 'Missing token or positional embeddings for model %s', model;
+        RAISE EXCEPTION 'Missing token or positional embeddings for model %', p_model;
     END IF;
 
     IF matched IS DISTINCT FROM seq_len THEN
         RAISE EXCEPTION USING
             ERRCODE = 'data_exception',
-            MESSAGE = format('Missing token or positional embeddings for model %s', model),
+            MESSAGE = format('Missing token or positional embeddings for model %s', p_model),
             DETAIL = format('Expected %s embeddings but only found %s', seq_len, matched);
     END IF;
 
@@ -823,10 +836,8 @@ CREATE UNLOGGED TABLE llm_tape (
     extra JSONB            -- shape info, constants (e.g., eps, dims)
 );
 
--- guard flag that toggles autograd recording
-CREATE UNLOGGED TABLE llm_autograd_mode (
-    flag BOOL NOT NULL
-);
+-- NOTE: llm_autograd_mode (the guard flag that toggles autograd recording)
+-- is defined once, earlier in this script.
 
 -- store actual data buffers
 CREATE UNLOGGED TABLE llm_tensor_rt (
@@ -846,15 +857,7 @@ CREATE UNLOGGED TABLE llm_tensor_map (
     PRIMARY KEY (model, name, token_id)
 );
 
-CREATE FUNCTION pg_llm_autograd_map_param(
-    model TEXT,
-    name TEXT,
-    token_id INT,
-    tensor BYTEA,
-    dims INT[] DEFAULT NULL)
-RETURNS VOID
-AS 'MODULE_PATHNAME', 'pg_llm_autograd_map_param'
-LANGUAGE C;
+-- NOTE: pg_llm_autograd_map_param is declared once, earlier in this script.
 
 CREATE OR REPLACE FUNCTION llm_materialize_params(p_model TEXT)
 RETURNS VOID AS $$
@@ -865,6 +868,7 @@ DECLARE
 BEGIN
     -- Clear cached tensors for this step
     DELETE FROM llm_tensor;
+    DELETE FROM llm_tensor_owner;
     DELETE FROM llm_tensor_map WHERE model = p_model;
 
     -- Copy parameters into the tensor cache and create runtime tensors
@@ -987,30 +991,35 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-BEGIN;
-  PERFORM llm_prune_autograd_state();
-
-  -- Forward pass with autograd enabled
-  INSERT INTO llm_autograd_mode VALUES(true);
-  PERFORM llm_loss(
-      'gpt2-small',
-      seq,
-      target,
-      (SELECT n_layer FROM llm_model_config WHERE model = 'gpt2-small'),
-      (SELECT n_head FROM llm_model_config WHERE model = 'gpt2-small'),
-      (SELECT d_model FROM llm_model_config WHERE model = 'gpt2-small'),
-      (SELECT vocab FROM llm_model_config WHERE model = 'gpt2-small'));
-
-  -- Reverse pass
-  PERFORM llm_backprop((SELECT MAX(id) FROM llm_tape), 'gpt2-small');
-
-  -- Gradient accumulation
-  PERFORM llm_accumulate_grads('gpt2-small');
-
-  -- Optimizer update
-  PERFORM llm_train_step(...);
-
-COMMIT;
+-- Reference sketch of a single training step. This is illustrative
+-- pseudo-code (it uses PL/pgSQL PERFORM outside a function body and
+-- placeholder identifiers), so it is kept commented out; executing it as
+-- part of CREATE EXTENSION would fail. See llm_train_step()/llm_train()
+-- below for the real implementation.
+-- BEGIN;
+--   PERFORM llm_prune_autograd_state();
+--
+--   -- Forward pass with autograd enabled
+--   INSERT INTO llm_autograd_mode VALUES(true);
+--   PERFORM llm_loss(
+--       'gpt2-small',
+--       seq,
+--       target,
+--       (SELECT n_layer FROM llm_model_config WHERE model = 'gpt2-small'),
+--       (SELECT n_head FROM llm_model_config WHERE model = 'gpt2-small'),
+--       (SELECT d_model FROM llm_model_config WHERE model = 'gpt2-small'),
+--       (SELECT vocab FROM llm_model_config WHERE model = 'gpt2-small'));
+--
+--   -- Reverse pass
+--   PERFORM llm_backprop((SELECT MAX(id) FROM llm_tape), 'gpt2-small');
+--
+--   -- Gradient accumulation
+--   PERFORM llm_accumulate_grads('gpt2-small');
+--
+--   -- Optimizer update
+--   PERFORM llm_train_step(...);
+--
+-- COMMIT;
 
 CREATE FUNCTION pg_llm_softmax_backward(y BYTEA, dy BYTEA)
 RETURNS BYTEA
@@ -1072,20 +1081,28 @@ END;
 $$ LANGUAGE plpgsql;
 
 CREATE TABLE llm_bpe_vocab (
-    model TEXT,
-    token_id INT PRIMARY KEY,
+    model TEXT NOT NULL,
+    token_id INT NOT NULL,
     token TEXT,               -- raw text form
     score FLOAT4,             -- optional rank / freq
-    bytes BYTEA               -- UTF-8 representation
+    bytes BYTEA,              -- UTF-8 representation
+    -- Keyed by model as well as id so that one database can hold the
+    -- tokenizers for several models at once.
+    PRIMARY KEY (model, token_id)
 );
 
+CREATE INDEX llm_bpe_vocab_token_idx ON llm_bpe_vocab (model, token);
+
 CREATE TABLE llm_bpe_merges (
-    model TEXT,
-    rank INT PRIMARY KEY,
-    left TEXT,
-    right TEXT,
-    pair TEXT                 -- "left right"
+    model TEXT NOT NULL,
+    rank INT NOT NULL,
+    "left" TEXT,
+    "right" TEXT,
+    pair TEXT,                -- "left right"
+    PRIMARY KEY (model, rank)
 );
+
+CREATE INDEX llm_bpe_merges_pair_idx ON llm_bpe_merges (model, "left", "right");
 
 CREATE FUNCTION pg_llm_load_bpe_vocab(path TEXT, model TEXT)
 RETURNS void
@@ -1097,49 +1114,168 @@ RETURNS void
 AS 'MODULE_PATHNAME', 'pg_llm_load_bpe_merges'
 LANGUAGE C STRICT;
 
-SELECT pg_llm_load_bpe_vocab('/mnt/gpt2/vocab.json','gpt2-small');
-SELECT pg_llm_load_bpe_merges('/mnt/gpt2/merges.txt','gpt2-small');
+-- Tokenizer assets are loaded after installation, once vocab.json/merges.txt are
+-- available on the server filesystem, e.g.:
+--   SELECT pg_llm_load_bpe_vocab('/mnt/gpt2/vocab.json','gpt2-small');
+--   SELECT pg_llm_load_bpe_merges('/mnt/gpt2/merges.txt','gpt2-small');
 
-CREATE OR REPLACE FUNCTION llm_encode(text_in TEXT, model TEXT)
+-- GPT-2 works on bytes, not characters: every input byte is first mapped to a
+-- printable code point (OpenAI's bytes_to_unicode table) so that the BPE merge
+-- table can be expressed as ordinary text.  This table is that mapping.
+CREATE TABLE llm_byte_encoder (
+    byte INT PRIMARY KEY,
+    ch   TEXT NOT NULL UNIQUE
+);
+
+-- Bytes that are already printable ASCII/Latin-1 map to themselves...
+INSERT INTO llm_byte_encoder(byte, ch)
+SELECT b, chr(b)
+  FROM generate_series(0, 255) AS g(b)
+ WHERE b BETWEEN 33 AND 126
+    OR b BETWEEN 161 AND 172
+    OR b BETWEEN 174 AND 255;
+
+-- ...and the remaining 68 (control characters, space, soft hyphen) are shifted
+-- into the U+0100 block in ascending byte order, exactly as GPT-2 does.
+INSERT INTO llm_byte_encoder(byte, ch)
+SELECT b, chr(256 + (ROW_NUMBER() OVER (ORDER BY b))::INT - 1)
+  FROM generate_series(0, 255) AS g(b)
+ WHERE NOT (b BETWEEN 33 AND 126
+         OR b BETWEEN 161 AND 172
+         OR b BETWEEN 174 AND 255);
+
+-- GPT-2's pre-tokenizer pattern, translated to POSIX ARE.  Splitting the input
+-- into these chunks before applying BPE stops merges from running across word
+-- boundaries.
+CREATE OR REPLACE FUNCTION llm_pretokenize(text_in TEXT)
+RETURNS TABLE(chunk TEXT, ord BIGINT) AS $$
+    SELECT m.chunk[1], m.ord
+      FROM regexp_matches(
+               text_in,
+               '''s|''t|''re|''ve|''m|''ll|''d'
+               || '| ?[[:alpha:]]+'
+               || '| ?[[:digit:]]+'
+               || '| ?[^[:space:][:alpha:][:digit:]]+'
+               || '|[[:space:]]+(?![^[:space:]])'
+               || '|[[:space:]]+',
+               'g') WITH ORDINALITY AS m(chunk, ord);
+$$ LANGUAGE sql STABLE;
+
+-- Byte-pair-encode one pre-tokenized chunk into token ids.
+CREATE OR REPLACE FUNCTION llm_encode_chunk(chunk TEXT, p_model TEXT)
 RETURNS INT[] AS $$
 DECLARE
-    tokens TEXT[];
-    pairs TEXT[];
-    merged TEXT;
-    done BOOL := false;
+    symbols  TEXT[];
+    merged   TEXT[];
+    best_l   TEXT;
+    best_r   TEXT;
+    i        INT;
+    n        INT;
 BEGIN
-    -- split into UTF-8 bytes
-    SELECT array_agg(chr(get_byte(t::bytea,i)))
-    INTO tokens
-    FROM generate_series(0,length(t::bytea)-1) i, (SELECT convert_to(text_in,'UTF8') t) _;
-    
-    WHILE NOT done LOOP
-        pairs := ARRAY(
-            SELECT format('%s %s',tokens[i],tokens[i+1])
-            FROM generate_series(1,array_length(tokens,1)-1) g(i)
-        );
-        SELECT pair INTO merged
-        FROM llm_bpe_merges WHERE model=model AND pair=ANY(pairs)
-        ORDER BY rank LIMIT 1;
-        IF merged IS NULL THEN
-            done := true;
-        ELSE
-            tokens := (
-                SELECT array_agg(CASE
-                    WHEN i<array_length(tokens,1)
-                      AND format('%s %s',tokens[i],tokens[i+1])=merged
-                    THEN split_part(merged,' ',1)||split_part(merged,' ',2)
-                    ELSE tokens[i]
-                END ORDER BY i)
-                FROM generate_series(1,array_length(tokens,1)) g(i)
-            );
-        END IF;
+    IF chunk IS NULL OR chunk = '' THEN
+        RETURN ARRAY[]::INT[];
+    END IF;
+
+    -- One symbol per input byte, via the bytes_to_unicode mapping.
+    SELECT array_agg(e.ch ORDER BY g.i)
+      INTO symbols
+      FROM generate_series(0, octet_length(convert_to(chunk, 'UTF8')) - 1) AS g(i)
+      JOIN llm_byte_encoder e
+        ON e.byte = get_byte(convert_to(chunk, 'UTF8'), g.i);
+
+    -- Repeatedly merge the adjacent pair with the lowest merge rank.
+    LOOP
+        n := COALESCE(array_length(symbols, 1), 0);
+        EXIT WHEN n < 2;
+
+        best_l := NULL;
+        best_r := NULL;
+
+        SELECT symbols[p.i], symbols[p.i + 1]
+          INTO best_l, best_r
+          FROM generate_series(1, n - 1) AS p(i)
+          JOIN llm_bpe_merges m
+            ON m.model = p_model
+           AND m."left" = symbols[p.i]
+           AND m."right" = symbols[p.i + 1]
+         ORDER BY m.rank
+         LIMIT 1;
+
+        EXIT WHEN best_l IS NULL;
+
+        merged := ARRAY[]::TEXT[];
+        i := 1;
+        WHILE i <= n LOOP
+            IF i < n AND symbols[i] = best_l AND symbols[i + 1] = best_r THEN
+                merged := merged || (best_l || best_r);
+                i := i + 2;
+            ELSE
+                merged := merged || symbols[i];
+                i := i + 1;
+            END IF;
+        END LOOP;
+        symbols := merged;
     END LOOP;
 
-    RETURN ARRAY(
-        SELECT token_id FROM llm_bpe_vocab
-        WHERE token=ANY(tokens) ORDER BY array_position(tokens,token)
-    );
+    RETURN COALESCE((
+        SELECT array_agg(v.token_id ORDER BY s.ord)
+          FROM unnest(symbols) WITH ORDINALITY AS s(sym, ord)
+          JOIN llm_bpe_vocab v
+            ON v.model = p_model
+           AND v.token = s.sym
+    ), ARRAY[]::INT[]);
+END;
+$$ LANGUAGE plpgsql STABLE;
+
+CREATE OR REPLACE FUNCTION llm_encode(text_in TEXT, p_model TEXT)
+RETURNS INT[] AS $$
+DECLARE
+    ids INT[] := ARRAY[]::INT[];
+    rec RECORD;
+BEGIN
+    IF text_in IS NULL OR text_in = '' THEN
+        RETURN ids;
+    END IF;
+
+    FOR rec IN
+        SELECT t.chunk FROM llm_pretokenize(text_in) AS t ORDER BY t.ord
+    LOOP
+        ids := ids || llm_encode_chunk(rec.chunk, p_model);
+    END LOOP;
+
+    RETURN ids;
+END;
+$$ LANGUAGE plpgsql STABLE;
+
+-- Inference-only counterpart to llm_materialize_params: llm_forward_gpt2 reads
+-- the per-layer weights out of the llm_tensor cache, so the cache has to be
+-- warm before a forward pass.  Unlike the training path this skips the autograd
+-- runtime tables and the (large) embedding rows, which llm_embed and the final
+-- projection read straight from llm_param_resolved.
+CREATE OR REPLACE FUNCTION llm_materialize_inference_params(
+    p_model TEXT,
+    p_force BOOLEAN DEFAULT false)
+RETURNS VOID AS $$
+BEGIN
+    IF NOT p_force
+       AND EXISTS (SELECT 1 FROM llm_tensor_owner o WHERE o.model = p_model)
+    THEN
+        RETURN;
+    END IF;
+
+    DELETE FROM llm_tensor;
+
+    INSERT INTO llm_tensor(name, data, requires_grad)
+    SELECT p.name, p.data, false
+      FROM llm_param_resolved p
+     WHERE p.model = p_model
+       AND p.name NOT IN ('wte', 'wpe')
+    ON CONFLICT (name) DO UPDATE
+        SET data = EXCLUDED.data,
+            requires_grad = EXCLUDED.requires_grad;
+
+    DELETE FROM llm_tensor_owner;
+    INSERT INTO llm_tensor_owner(model) VALUES (p_model);
 END;
 $$ LANGUAGE plpgsql;
 
@@ -1149,7 +1285,8 @@ CREATE OR REPLACE FUNCTION llm_logits(
     n_layer INT DEFAULT NULL,
     n_head INT DEFAULT NULL,
     d_model INT DEFAULT NULL,
-    vocab_size INT DEFAULT NULL)
+    vocab_size INT DEFAULT NULL,
+    last_only BOOLEAN DEFAULT false)
 RETURNS BYTEA AS $$
 DECLARE
     seq_len INT := COALESCE(array_length(token_ids, 1), 0);
@@ -1196,6 +1333,8 @@ BEGIN
            AND p.name = 'wte';
     END IF;
 
+    PERFORM llm_materialize_inference_params(model_name);
+
     x := llm_embed(token_ids, model_name, effective_d_model);
 
     x := llm_forward_gpt2(
@@ -1208,7 +1347,7 @@ BEGIN
         dropout_p => 0.0::float4,
         training => false);
 
-    SELECT string_agg(p.data::TEXT, '' ORDER BY p.token_id)::BYTEA
+    SELECT string_agg(p.data, ''::BYTEA ORDER BY p.token_id)
       INTO weight_matrix
       FROM llm_param_resolved p
      WHERE p.model = model_name
@@ -1218,19 +1357,165 @@ BEGIN
         RAISE EXCEPTION 'Missing token embeddings for model %', model_name;
     END IF;
 
+    -- Autoregressive sampling only ever needs the distribution for the token
+    -- after the prompt, so projecting just the final hidden row turns the
+    -- vocabulary matmul from seq_len x d_model x vocab into 1 x d_model x vocab.
+    IF last_only THEN
+        x := substring(x
+                       FROM ((seq_len - 1) * effective_d_model * 4) + 1
+                       FOR effective_d_model * 4);
+        RETURN pg_llm_matmul(x, weight_matrix, 1, effective_d_model, effective_vocab);
+    END IF;
+
     RETURN pg_llm_matmul(x, weight_matrix, seq_len, effective_d_model, effective_vocab);
 END;
 $$ LANGUAGE plpgsql;
 
-CREATE OR REPLACE FUNCTION llm_decode(ids INT[], model TEXT)
+-- Lossy UTF-8 decode. BPE tokens are byte sequences, so a sampled sequence is
+-- not guaranteed to be well-formed text; invalid bytes become U+FFFD instead of
+-- failing the whole decode.
+CREATE OR REPLACE FUNCTION llm_bytes_to_text(buf BYTEA)
 RETURNS TEXT AS $$
 DECLARE
-    s TEXT := '';
+    n        INT := octet_length(buf);
+    i        INT := 0;
+    k        INT;
+    lead     INT;
+    cont     INT;
+    width    INT;
+    codepoint INT;
+    valid    BOOLEAN;
+    replacement TEXT := U&'\FFFD';
+    parts    TEXT[] := ARRAY[]::TEXT[];
 BEGIN
-    SELECT string_agg(token,'') INTO s
-    FROM llm_bpe_vocab WHERE model=model AND token_id=ANY(ids)
-    ORDER BY array_position(ids,token_id);
-    RETURN s;
+    WHILE i < n LOOP
+        lead := get_byte(buf, i);
+
+        IF lead < 128 THEN
+            width := 1; codepoint := lead;
+        ELSIF lead BETWEEN 194 AND 223 THEN
+            width := 2; codepoint := lead - 192;
+        ELSIF lead BETWEEN 224 AND 239 THEN
+            width := 3; codepoint := lead - 224;
+        ELSIF lead BETWEEN 240 AND 244 THEN
+            width := 4; codepoint := lead - 240;
+        ELSE
+            width := 0; codepoint := 0;
+        END IF;
+
+        valid := width > 0 AND i + width <= n;
+
+        IF valid THEN
+            FOR k IN 1 .. width - 1 LOOP
+                cont := get_byte(buf, i + k);
+                IF cont < 128 OR cont > 191 THEN
+                    valid := false;
+                    EXIT;
+                END IF;
+                codepoint := codepoint * 64 + (cont - 128);
+            END LOOP;
+        END IF;
+
+        -- Postgres cannot represent NUL in text, and surrogates are not scalar
+        -- values, so both are treated as invalid here.
+        IF valid AND (codepoint = 0
+                      OR codepoint > 1114111
+                      OR codepoint BETWEEN 55296 AND 57343) THEN
+            valid := false;
+        END IF;
+
+        IF valid THEN
+            parts := parts || chr(codepoint);
+            i := i + width;
+        ELSE
+            parts := parts || replacement;
+            i := i + 1;
+        END IF;
+    END LOOP;
+
+    RETURN array_to_string(parts, '');
+END;
+$$ LANGUAGE plpgsql IMMUTABLE STRICT;
+
+CREATE OR REPLACE FUNCTION llm_decode(ids INT[], p_model TEXT)
+RETURNS TEXT AS $$
+DECLARE
+    symbols TEXT;
+    buf     BYTEA;
+    trimmed INT := 0;
+BEGIN
+    IF ids IS NULL OR array_length(ids, 1) IS NULL THEN
+        RETURN '';
+    END IF;
+
+    SELECT string_agg(v.token, '' ORDER BY t.ord)
+      INTO symbols
+      FROM unnest(ids) WITH ORDINALITY AS t(id, ord)
+      JOIN llm_bpe_vocab v
+        ON v.model = p_model
+       AND v.token_id = t.id;
+
+    IF symbols IS NULL OR symbols = '' THEN
+        RETURN '';
+    END IF;
+
+    -- Reverse the bytes_to_unicode mapping to recover the original byte stream.
+    SELECT string_agg(set_byte('\x00'::BYTEA, 0, e.byte), ''::BYTEA ORDER BY c.ord)
+      INTO buf
+      FROM regexp_split_to_table(symbols, '') WITH ORDINALITY AS c(ch, ord)
+      JOIN llm_byte_encoder e
+        ON e.ch = c.ch;
+
+    IF buf IS NULL THEN
+        RETURN '';
+    END IF;
+
+    -- Fast path: the sequence is already well-formed text.
+    BEGIN
+        RETURN convert_from(buf, 'UTF8');
+    EXCEPTION WHEN OTHERS THEN
+        NULL;
+    END;
+
+    -- A partial generation commonly ends mid-codepoint. Dropping the incomplete
+    -- tail keeps streaming output clean without introducing replacement chars.
+    WHILE trimmed < 3 LOOP
+        trimmed := trimmed + 1;
+        IF octet_length(buf) <= trimmed THEN
+            EXIT;
+        END IF;
+        BEGIN
+            RETURN convert_from(substring(buf FROM 1 FOR octet_length(buf) - trimmed), 'UTF8');
+        EXCEPTION WHEN OTHERS THEN
+            NULL;
+        END;
+    END LOOP;
+
+    -- Genuinely invalid bytes somewhere in the middle: decode what we can.
+    RETURN llm_bytes_to_text(buf);
+END;
+$$ LANGUAGE plpgsql STABLE;
+
+-- Single autoregressive step: score the sequence so far and sample the next
+-- token id.  llm_generate/llm_generate_stream build on this, and it also lets a
+-- client drive the loop itself when it wants each token as soon as it exists
+-- (PL/pgSQL set-returning functions buffer their whole result before the first
+-- row is visible, so llm_generate_stream cannot stream over the wire).
+CREATE OR REPLACE FUNCTION llm_next_token(
+    token_ids INT[],
+    model_name TEXT DEFAULT 'gpt2-small',
+    temperature FLOAT4 DEFAULT 1.0,
+    topk INT DEFAULT 50,
+    topp FLOAT4 DEFAULT 0.95)
+RETURNS INT AS $$
+BEGIN
+    IF token_ids IS NULL OR array_length(token_ids, 1) IS NULL THEN
+        RAISE EXCEPTION 'llm_next_token requires at least one token';
+    END IF;
+
+    RETURN pg_llm_sample(
+               llm_logits(token_ids, model_name, last_only => true),
+               temperature, topk, topp);
 END;
 $$ LANGUAGE plpgsql;
 
@@ -1248,7 +1533,7 @@ DECLARE
     next_id INT;
 BEGIN
     FOR i IN 1..max_tokens LOOP
-        next_id := pg_llm_sample(llm_logits(ids, model_name), temperature, topk, topp);
+        next_id := llm_next_token(ids, model_name, temperature, topk, topp);
         ids := array_append(ids, next_id);
         EXIT WHEN next_id = eos_token;
     END LOOP;
@@ -1280,7 +1565,7 @@ BEGIN
         EXIT WHEN step >= max_tokens;
         step := step + 1;
 
-        next_id := pg_llm_sample(llm_logits(ids, model_name), temperature, topk, topp);
+        next_id := llm_next_token(ids, model_name, temperature, topk, topp);
         ids := array_append(ids, next_id);
 
         token_id := next_id;

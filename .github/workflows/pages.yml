@@ -1,0 +1,70 @@
+name: Deploy chat UI to GitHub Pages
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'site/**'
+      - '.github/workflows/pages.yml'
+  workflow_dispatch:
+    inputs:
+      endpoint:
+        description: 'Default pg_gpt2 endpoint base URL to bake into the page (optional)'
+        required: false
+        type: string
+      model:
+        description: 'Default model name (optional)'
+        required: false
+        type: string
+
+# Allow one deployment at a time; queued runs supersede rather than interleave.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Assemble site
+        env:
+          # A repository variable lets the published page default to a live
+          # endpoint. Without one the page asks the visitor for a URL.
+          DEFAULT_ENDPOINT: ${{ inputs.endpoint || vars.PG_GPT2_ENDPOINT }}
+          DEFAULT_MODEL: ${{ inputs.model || vars.PG_GPT2_MODEL }}
+        run: |
+          mkdir -p _site
+          cp -r site/. _site/
+          # GitHub Pages runs the contents through Jekyll unless told not to.
+          touch _site/.nojekyll
+          if [ -n "$DEFAULT_ENDPOINT" ]; then
+            printf '{"endpoint":"%s","model":"%s"}\n' \
+              "$DEFAULT_ENDPOINT" "$DEFAULT_MODEL" > _site/config.json
+            echo "Baked default endpoint: $DEFAULT_ENDPOINT"
+          else
+            echo "No PG_GPT2_ENDPOINT variable set; the page will prompt for one."
+          fi
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

@@ -100,7 +100,7 @@ Datum pg_llm_load_bpe_merges(PG_FUNCTION_ARGS)
     char l[256], r[256];
     int rank = 0;
     const char *query =
-        "INSERT INTO llm_bpe_merges(model,rank,left,right,pair)"
+        "INSERT INTO llm_bpe_merges(model,rank,\"left\",\"right\",pair)"
         "VALUES($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING;";
     Oid argtypes[5] = {TEXTOID, INT4OID, TEXTOID, TEXTOID, TEXTOID};
     char nulls[5] = {' ', ' ', ' ', ' ', ' '};
